@@ -22,10 +22,15 @@
 //! `OffsetPageTable` over the CPU's actual CR3, a kernel heap that's
 //! really mapped page-by-page instead of static BSS (`allocator.rs`), and
 //! a real page fault deliberately triggered and demand-paged by
-//! `interrupts.rs`'s handler — and a real ring-3 → ring-0 privilege
+//! `interrupts.rs`'s handler — a real ring-3 → ring-0 privilege
 //! transition (`syscall.rs`): actual CPL3 code, on real hardware,
 //! trapping into the kernel via a real `int 0x80` and being observed by a
-//! real handler.
+//! real handler — and real NX/SMEP/SMAP (`cpu_features.rs`): real
+//! `EFER.NXE` and `CR4.SMEP`/`CR4.SMAP`, each gated on a real CPUID check,
+//! with every data page this kernel maps (heap, demand-paged region, the
+//! ring-3 demo's user stack) actually marked non-executable and the one
+//! real kernel write into a user-accessible page wrapped in real
+//! `stac`/`clac`.
 
 #![no_std]
 #![no_main]
@@ -35,6 +40,7 @@ extern crate alloc;
 
 mod allocator;
 mod context;
+mod cpu_features;
 mod gdt;
 mod interrupts;
 mod paging;
@@ -114,6 +120,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
     let mut mapper = unsafe { paging::init(physical_memory_offset) };
 
+    // --- Real NX/SMEP/SMAP, each gated on a real CPUID check. Must run
+    // before any page is mapped with NO_EXECUTE (allocator::init_bootstrap,
+    // right below, is the very first) and before any user-accessible page
+    // exists (syscall::run_demo_syscall, much later) — see cpu_features.rs
+    // module docs. ---
+    let cpu_security = cpu_features::init();
+
     let largest_usable = boot_info
         .memory_regions
         .iter()
@@ -154,6 +167,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let mut seq = BootSequencer::new();
     let mut results = CheckResults::new();
+
+    // --- Real NX/SMEP/SMAP: read back the actual CR4/EFER hardware state
+    // (not just "cpu_features::init() was called") and confirm every bit
+    // CPUID said was supported really did get set. The kernel heap mapped
+    // just above already has NO_EXECUTE on it if cpu_security.nx is true —
+    // this kernel booting cleanly at all past that point is itself real
+    // evidence the EFER.NXE-before-NO_EXECUTE-mapping ordering held. ---
+    let cpu_security_ok = {
+        use x86_64::registers::control::{Cr4, Cr4Flags};
+        use x86_64::registers::model_specific::{Efer, EferFlags};
+        let efer = Efer::read();
+        let cr4 = Cr4::read();
+        cpu_security.nx == efer.contains(EferFlags::NO_EXECUTE_ENABLE)
+            && cpu_security.smep == cr4.contains(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION)
+            && cpu_security.smap == cr4.contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION)
+    };
+    results.record(
+        "CpuSecurity: real EFER.NXE/CR4.SMEP/CR4.SMAP match what CPUID said was supported",
+        cpu_security_ok,
+    );
 
     // --- EarlyBoot: GDT + IDT, mirroring kernel/boot.ti's early_boot ---
     gdt::init();

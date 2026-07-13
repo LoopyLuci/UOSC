@@ -91,7 +91,9 @@ extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFrame, e
 
     if (crate::paging::DEMAND_PAGE_REGION_START..crate::paging::DEMAND_PAGE_REGION_END).contains(&faulting_addr) {
         let page_vaddr = VirtAddr::new(faulting_addr & !0xFFF);
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        // Demand-paged memory is data (the boot self-test only ever writes
+        // a u64 to it) — real NX applies here too, same as the kernel heap.
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | crate::cpu_features::nx_flag();
         let mapped = crate::paging::with_mapper_and_phys(|mapper, phys| {
             crate::paging::map_page(mapper, phys, page_vaddr, flags).is_ok()
         })

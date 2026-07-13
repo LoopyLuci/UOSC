@@ -13,10 +13,17 @@
 //! privilege-level transition with real preemptive switching (a timer
 //! tick landing mid-ring-3, deciding to switch tasks, while running on
 //! the syscall entry's dedicated RSP0 stack) is real, additional
-//! complexity not attempted in this pass. Also still not attempted:
-//! SMEP/SMAP (the kernel can freely read/write/execute the "user" pages),
-//! NX enforcement (those pages are writable *and* executable), and more
+//! complexity not attempted in this pass. Also still not attempted: more
 //! than one ring-3 program ever existing at once.
+//!
+//! **NX/SMEP/SMAP** (`cpu_features.rs`) now apply for real: the user code
+//! page stays executable (real ring-3 code actually runs from it every
+//! boot) but the user stack page carries real NX, and the one kernel write
+//! into the user code page (copying `USER_PROGRAM` in, below) is wrapped
+//! in real `stac`/`clac` so it survives real `CR4.SMAP` being set. SMEP
+//! itself (forbidding the *kernel* from executing user-accessible pages)
+//! is enabled but has no real trap to trigger in this codebase — the
+//! kernel never attempts it anywhere.
 //!
 //! ## The mechanism
 //!
@@ -191,19 +198,36 @@ extern "C" fn record_syscall(number: u64) {
 /// in trap order, once the exit syscall has resumed this kernel context —
 /// `None` if the pages couldn't be mapped (paging not yet initialized).
 pub fn run_demo_syscall() -> Option<[u64; 3]> {
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    // The code page deliberately does *not* carry the NX flag — this is
+    // the one page in the whole kernel that real ring-3 code must actually
+    // execute out of. The stack page does: a user stack has no legitimate
+    // reason to ever be fetched from, and real NX now forbids it.
+    let code_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let stack_flags = code_flags | crate::cpu_features::nx_flag();
 
     crate::paging::with_mapper_and_phys(|mapper, phys| {
-        crate::paging::map_page(mapper, phys, VirtAddr::new(USER_CODE_ADDR), flags)
+        crate::paging::map_page(mapper, phys, VirtAddr::new(USER_CODE_ADDR), code_flags)
     })?
     .ok()?;
     crate::paging::with_mapper_and_phys(|mapper, phys| {
-        crate::paging::map_page(mapper, phys, VirtAddr::new(USER_STACK_ADDR), flags)
+        crate::paging::map_page(mapper, phys, VirtAddr::new(USER_STACK_ADDR), stack_flags)
     })?
     .ok()?;
 
-    unsafe {
-        core::ptr::copy_nonoverlapping(USER_PROGRAM.as_ptr(), USER_CODE_ADDR as *mut u8, USER_PROGRAM.len());
+    // The one real write this kernel (CPL0) makes into a user-accessible
+    // (U/S=1) page. With real CR4.SMAP set, doing this without stac/clac
+    // first is a real #PF, not a hypothetical one — verified by actually
+    // removing this wrapping and observing exactly that fault; see
+    // STATUS.md. `Smap::new()` returns `None` on CPUID that doesn't
+    // support SMAP at all, in which case CR4.SMAP was never set either
+    // (cpu_features::init) and the plain write below is already safe.
+    match x86_64::instructions::smap::Smap::new() {
+        Some(smap) => smap.without_smap(|| unsafe {
+            core::ptr::copy_nonoverlapping(USER_PROGRAM.as_ptr(), USER_CODE_ADDR as *mut u8, USER_PROGRAM.len());
+        }),
+        None => unsafe {
+            core::ptr::copy_nonoverlapping(USER_PROGRAM.as_ptr(), USER_CODE_ADDR as *mut u8, USER_PROGRAM.len());
+        },
     }
 
     let selectors = crate::gdt::selectors();

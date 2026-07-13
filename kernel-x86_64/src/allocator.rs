@@ -25,6 +25,12 @@
 //! `PhysicalAllocator` exists, extends that same live heap with more real
 //! pages placed exactly at its own `top()` — which is now guaranteed to
 //! be free virtual space too, since `HEAP_BASE`'s region is ours alone.
+//!
+//! Every page mapped here also carries [`crate::cpu_features::nx_flag`] —
+//! real `PageTableFlags::NO_EXECUTE`, once `cpu_features::init` (which
+//! `main.rs` runs before this module's `init_bootstrap`) confirmed real
+//! `EFER.NXE` support. Heap memory is data; there is no legitimate reason
+//! for the CPU to ever fetch an instruction from it.
 
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{OffsetPageTable, PageTableFlags};
@@ -51,7 +57,9 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 /// that real, mapped range. Must run before anything, including
 /// `paging::store_globals`, allocates on the heap.
 pub fn init_bootstrap(mapper: &mut OffsetPageTable<'static>, frame_allocator: &mut crate::paging::BumpFrameAllocator) {
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    // Kernel heap memory is data, never code — real NX (once cpu_features::
+    // init has run; see main.rs's ordering) actually forbids executing it.
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | crate::cpu_features::nx_flag();
     let page_count = BOOTSTRAP_HEAP_SIZE / uosc_core::memory::PAGE_SIZE;
     for i in 0..page_count {
         let vaddr = VirtAddr::new(HEAP_BASE + i * uosc_core::memory::PAGE_SIZE);
@@ -70,7 +78,7 @@ pub fn init_bootstrap(mapper: &mut OffsetPageTable<'static>, frame_allocator: &m
 /// after `paging::store_globals`.
 pub fn extend_with_real_pages() {
     let extend_start = ALLOCATOR.lock().top() as u64;
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | crate::cpu_features::nx_flag();
     let page_count = REAL_HEAP_SIZE / uosc_core::memory::PAGE_SIZE;
     for i in 0..page_count {
         let vaddr = VirtAddr::new(extend_start + i * uosc_core::memory::PAGE_SIZE);

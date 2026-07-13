@@ -43,7 +43,9 @@ qemu-system-x86_64 -drive format=raw,file=uosc-bios.img \
 
 ```
 UOSC x86-64 — real boot starting
+[cpu] NX=true (EFER.NXE) SMEP=false SMAP=false (CR4), each gated on a real CPUID check
 [memory] real usable region 0x1473000..0x7fe0000, using 27501 pages for the real PhysicalAllocator
+[PASS] CpuSecurity: real EFER.NXE/CR4.SMEP/CR4.SMAP match what CPUID said was supported
 [PASS] EarlyBoot: GDT + IDT installed
 [PASS] LateBoot: PIC/PIT/interrupts enabled
 [PASS] Memory: real PhysicalAllocator over real bootloader memory map
@@ -79,15 +81,20 @@ UOSC x86-64 — real boot starting
 [boot] SyscallBoot: a real int 0x80 entry point now exists (see the Syscall check above) — BootSequencer's SyscallBoot phase itself is still not completed, since there is no general syscall ABI or process model behind it yet
 [PASS] Scheduler: real context switches actually ran both kernel tasks, driven by the real hardware timer
 
-=== UOSC boot self-test: 13/13 checks passed ===
+=== UOSC boot self-test: 14/14 checks passed ===
 ```
 
 QEMU's process exit code: `33`, which decodes (per `isa-debug-exit`'s
 `(value << 1) | 1` convention) to `ExitCode::Success = 0x10` — a real,
-scriptable pass signal, not a human reading a terminal. Reproduced 3
-consecutive independent BIOS runs and one independent UEFI run (real EDK2
-firmware, bundled with this environment's QEMU install — see "UEFI boot"
-below), byte-for-byte identical pass/fail shape each time.
+scriptable pass signal, not a human reading a terminal. Reproduced across
+independent BIOS runs (both on QEMU's default CPU model, where `SMEP`/
+`SMAP` report unsupported and are correctly left off, and with
+`-cpu qemu64,+smep,+smap` forcing both on — see "Real NX/SMEP/SMAP"
+below) and an independent UEFI run (real EDK2 firmware, bundled with this
+environment's QEMU install — see "UEFI boot" below), byte-for-byte
+identical pass/fail shape each time, plus one clean rebuild from scratch
+(`rm -rf target`) re-verified on the exact commit-bound code to rule out
+stale-cache masking.
 
 ## What actually happens at boot, and what code runs it
 
@@ -100,17 +107,20 @@ below), byte-for-byte identical pass/fail shape each time.
    kernel already has a real `OffsetPageTable` over the CPU's actual CR3
    and a real kernel heap backed by individually mapped pages, not a
    static BSS array.
-3. **Real GDT + IDT** (`gdt.rs`, `interrupts.rs`) — a genuine x86-64
+3. **Real NX/SMEP/SMAP** (`cpu_features.rs`), immediately after the
+   `OffsetPageTable` exists and before the first heap page is ever
+   mapped — see "Real NX/SMEP/SMAP" below.
+5. **Real GDT + IDT** (`gdt.rs`, `interrupts.rs`) — a genuine x86-64
    descriptor table setup, including a dedicated IST stack for double
    faults. This is the hardware-specific step `kernel/boot.ti`'s
    `init_gdt()`/`init_idt()` describes but `reference-rs` deliberately
    never implemented (no hardware to target from a portable `no_std` lib).
-4. **Real PIC remap + PIT reprogram** (`interrupts.rs`, `pit.rs`) — and
+6. **Real PIC remap + PIT reprogram** (`interrupts.rs`, `pit.rs`) — and
    `pit.rs` calls `uosc_core::timer::pit_divisor` (the exact, tested
    function from `reference-rs`) to compute the divisor, then writes it to
    real hardware ports. First place in this whole effort where that
    "pure arithmetic" Phase-0 work drives real hardware.
-5. **Real physical memory**: the bootloader's actual memory map is scanned
+7. **Real physical memory**: the bootloader's actual memory map is scanned
    for the largest usable region, and that real address range (minus the
    handful of frames the paging bootstrap already consumed) seeds the one
    real, persistent `uosc_core::memory::PhysicalAllocator` — the same
@@ -119,17 +129,17 @@ below), byte-for-byte identical pass/fail shape each time.
    now allocating and freeing real physical pages, and now the same
    instance backing the heap and the page fault handler's demand paging
    too, not a disposable scratch copy.
-6. **A real page fault, deliberately triggered and demand-paged.** See
+8. **A real page fault, deliberately triggered and demand-paged.** See
    "Real hardware page tables" below.
-7. **A real ring-3 → ring-0 privilege transition.** See "Real ring-3
+9. **A real ring-3 → ring-0 privilege transition.** See "Real ring-3
    syscall" below.
-8. **Real capability, sanctum, and IPC checks** — `uosc_core::capability`,
+10. **Real capability, sanctum, and IPC checks** — `uosc_core::capability`,
    `uosc_core::sanctum`, and `uosc_core::ipc` run their real logic (issue a
    token, grant the issuer, deny a stranger; create a vault, enter it,
    confirm inside-region access and outside-region denial; create a port,
    send and receive a capability-checked message) against real allocated
    state, not test fixtures.
-9. **Real hardware-timer-driven scheduling, with a real context switch.**
+11. **Real hardware-timer-driven scheduling, with a real context switch.**
    The PIT fires a real interrupt at 200 Hz; each one calls into
    `scheduler_bridge.rs`, which runs the real
    `uosc_core::scheduler::RunQueue::pick_next_task`/`update_vruntime` — the
@@ -137,7 +147,7 @@ below), byte-for-byte identical pass/fail shape each time.
    general n-task proof cover — and now, when that decision actually
    changes which task should run, calls `context::switch_to` to really
    switch the CPU to it. See "Real context switching" below for how.
-10. **`uosc_core::boot::BootSequencer`** tracks real phase completion as
+12. **`uosc_core::boot::BootSequencer`** tracks real phase completion as
     each step above finishes, and `satisfies_ordering_invariant()` — the
     same function `Boot.lean` proves preserves Property 10 — is checked
     live at the end, not just in a unit test.
@@ -283,6 +293,56 @@ extending it to a real round trip:
    trap really did fire again, not just that the boot self-test happened
    to finish.
 
+## Real NX/SMEP/SMAP
+
+`cpu_features.rs` is new this pass. Real `EFER.NXE`, real `CR4.SMEP`, and
+real `CR4.SMAP` — each independently gated on a real CPUID check (`CPUID.
+80000001H:EDX.bit20` for NX, `CPUID.7.0:EBX.bit7`/`.bit20` for SMEP/SMAP),
+never set blind. `main.rs` runs this immediately after `paging::init`,
+before `allocator::init_bootstrap` maps the first heap page — setting
+`PageTableFlags::NO_EXECUTE` before `EFER.NXE=1` is a real reserved-bit
+`#PF` the first time hardware walks into that entry, not a hypothetical
+one, so the ordering is load-bearing.
+
+- **NX** is applied to every data page this kernel maps after boot: the
+  kernel heap (`allocator.rs`, both bootstrap and real phases), the
+  demand-paged region (`interrupts.rs`), and the ring-3 demo's user stack
+  (`syscall.rs`) — all via `cpu_features::nx_flag()`, which returns the
+  real flag only if CPUID actually confirmed support. The ring-3 demo's
+  *code* page deliberately keeps NX off, since real ring-3 code has to
+  actually execute out of it every boot.
+- **SMEP** is enabled (via a real, CPUID-gated `CR4` write) but has no
+  real trap to trigger in this codebase — the kernel never attempts to
+  execute an instruction from a user-accessible page anywhere. Verified
+  only as "the real bit is set when CPUID says it's supported" (the
+  `CpuSecurity` check below), not empirically fault-tested. Said plainly
+  rather than silently claimed as more than it is.
+- **SMAP** *is* genuinely exercised: `syscall.rs`'s one real kernel write
+  into a user-accessible page (copying the hand-assembled `USER_PROGRAM`
+  into the freshly mapped code page) is wrapped in real `stac`/`clac`
+  (`x86_64::instructions::smap::Smap`). This was verified the same way
+  the syscall round-trip bugs above were — by actually breaking it on
+  purpose and watching it fail: temporarily removing the `stac`/`clac`
+  wrapping, rebuilding, and booting with `-cpu qemu64,+smep,+smap` (QEMU's
+  default CPU model doesn't advertise SMEP/SMAP support at all, so forcing
+  them on is the only way to actually exercise this path) produced a real,
+  reproducible page fault:
+  ```
+  [PANIC] panicked at src\interrupts.rs:108:5:
+  EXCEPTION: PAGE FAULT at 0x666666660016, error PageFaultErrorCode(PROTECTION_VIOLATION | CAUSED_BY_WRITE) — outside the demand-page region, cannot recover
+  ```
+  — a genuine supervisor-mode write to a `USER_ACCESSIBLE` page, correctly
+  rejected by real `CR4.SMAP` hardware enforcement. Restoring the
+  `stac`/`clac` wrapping and rebuilding returned the boot to a clean
+  14/14, confirmed reproducibly on both the default CPU model (where
+  SMAP is unsupported and therefore never enforced — the wrapping is a
+  no-op there) and with `+smep,+smap` forced on (where it's real,
+  load-bearing protection).
+- **`CpuSecurity` self-test check**: reads back the real `EFER`/`CR4`
+  hardware state after `cpu_features::init` runs and confirms every bit
+  CPUID said was supported really did get set — a real register read-back,
+  not just "the function was called."
+
 ## UEFI boot
 
 Previously built but not boot-tested (no OVMF firmware available in that
@@ -301,7 +361,7 @@ qemu-system-x86_64 \
 ```
 
 Real OVMF `BdsDxe` boot-manager output precedes the kernel's own, then the
-same self-test runs and passes: **13/13 checks, exit code 33.** Both boot
+same self-test runs and passes: **14/14 checks, exit code 33.** Both boot
 paths are now real, observed, passing runs, not one tested and one merely
 "should work."
 
@@ -394,13 +454,18 @@ hardware.
   real, repeated privilege transitions, but still no general syscall ABI
   (no argument-passing convention beyond "the value happens to be in
   rax"), no process/exit semantics beyond this one hardcoded exit value,
-  no SMEP/SMAP (the kernel can freely read/write/execute the "user"
-  pages), no NX enforcement (those pages are writable *and* executable),
   and only ever one ring-3 program existing at a time.
   `BootSequencer`'s `SyscallBoot` phase itself is still deliberately left
   incomplete — a real trap-and-handle mechanism now exists, but there is
   no general syscall ABI or process model behind it, and the live
   self-test output says so rather than silently marking the phase done.
+- **NX/SMEP/SMAP are real but narrow.** NX and SMAP are both genuinely
+  enforced and empirically exercised (see "Real NX/SMEP/SMAP" above); SMEP
+  is enabled and CPUID-gated correctly but has no real fault-and-recover
+  test in this codebase, since the kernel never attempts what it would
+  catch. No page carries a fine-grained read-only/read-write distinction
+  beyond what already existed (every mapped page here is still
+  `WRITABLE`); no protection-key (`PKU`) support; no CET/shadow stacks.
 - **No filesystem, no network, no SMP.**
 - **Not RISC-V, not AArch64, not on real (non-emulated) hardware.** QEMU is
   a real, high-fidelity emulator, not a rubber stamp — but it is not a
