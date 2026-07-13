@@ -42,6 +42,7 @@
 
 extern crate alloc;
 
+mod address_space;
 mod allocator;
 mod context;
 mod cpu_features;
@@ -297,6 +298,34 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     results.record(
         "Unmap: a real page unmap freed the real physical frame, and the address really re-faulted",
         unmap_ok,
+    );
+
+    // --- Real multiple address spaces: a second, genuinely independent
+    // CR3-loadable L4 table, not a second region within the same one. See
+    // address_space.rs's module docs for the full mechanism. Checks, in
+    // order: (1) the private address is genuinely absent from the
+    // original/active table *before* any switch — proof the clone didn't
+    // leak it backward; (2) a real CR3 write to the new table, then a
+    // real read straight through the virtual address (no physical-offset
+    // back door) resolves to the exact value only that table's private
+    // mapping holds; (3) a real CR3 write back to the original table.
+    // Every check below this one still passing is itself further, real
+    // evidence the restore was exact. ---
+    let address_space_ok = address_space::with_lock(|| {
+        let absent_before = address_space::private_region_absent_from_active();
+        let Some(new_space) = address_space::AddressSpace::new() else {
+            return false;
+        };
+        let prev_frame = unsafe { new_space.switch_to() };
+        let value_in_new = unsafe { (address_space::PRIVATE_REGION_ADDR as *const u64).read_volatile() };
+        unsafe {
+            address_space::restore(prev_frame);
+        }
+        absent_before && value_in_new == address_space::PRIVATE_VALUE
+    });
+    results.record(
+        "AddressSpace: a real second CR3-loadable page table, verified absent-then-present-then-restored",
+        address_space_ok,
     );
 
     // --- Real ring-3 → ring-0 privilege transition, deliberately run

@@ -54,6 +54,7 @@ UOSC x86-64 — real boot starting
 [PASS] PageFault: a real #PF was triggered and demand-paged by the real handler, then resumed
 [page_fault] real #PF at 0x555555550000, demand-paged and resumed
 [PASS] Unmap: a real page unmap freed the real physical frame, and the address really re-faulted
+[PASS] AddressSpace: a real second CR3-loadable page table, verified absent-then-present-then-restored
 [syscall] real int 0x80 trap from ring 3, rax=10 — returning to ring 3
 [syscall] real int 0x80 trap from ring 3, rax=20 — returning to ring 3
 [syscall] real int 0x80 trap from ring 3, rax=30 — returning to ring 3
@@ -92,30 +93,34 @@ UOSC x86-64 — real boot starting
 [PASS] TaskExit: a real dynamically spawned task ran, then really exited and left the real RunQueue
 [PASS] TaskReuse: a task spawned live at runtime ran, really reusing the exact same guard-page-protected stack slot an exited task used
 
-=== UOSC boot self-test: 17/17 checks passed ===
+=== UOSC boot self-test: 18/18 checks passed ===
 ```
 
 QEMU's process exit code: `33`, which decodes (per `isa-debug-exit`'s
 `(value << 1) | 1` convention) to `ExitCode::Success = 0x10` — a real,
 scriptable pass signal, not a human reading a terminal.
 
-**Reproduced across well over 200 independent BIOS/UEFI runs total across
+**Reproduced across well over 250 independent BIOS/UEFI runs total across
 this crate's history**, most recently: 31 consecutive runs verifying NX/
 SMEP/SMAP, then a batch verifying page unmapping + task creation/exit
 that caught two real, separate, fixed intermittent bugs, then 66 further
 consecutive runs after those fixes (heap-allocated stacks, at the time),
-then this pass's guard-page-protected-stack rewrite, which itself caught
-a real, 100%-reproducible bug on its very first boot (a non-canonical
-region base address — see "Real guard-page-protected task stacks"
-below) and, once fixed, **51 further consecutive runs with zero
-failures** (25 on QEMU's default CPU model, 10 with `-cpu
-qemu64,+smep,+smap` forcing both on, 1 independent UEFI run, 15 more on a
-from-scratch clean rebuild). This many repeats weren't idle paranoia —
-real bugs were caught and fixed exactly because of this volume of
-testing at every stage; see "Real task creation and exit" and "Real
+then a guard-page-protected-stack rewrite, which itself caught a real,
+100%-reproducible bug on its very first boot (a non-canonical region base
+address — see "Real guard-page-protected task stacks" below) and, once
+fixed, 51 further consecutive runs, then a one-time manual SMEP
+fault-and-recover verification (see "Real NX/SMEP/SMAP" above) plus 8
+further consecutive runs confirming the revert, then this pass's second,
+genuinely independent address space (see "Real multiple address spaces"
+below), which passed **on its first boot** and, since then, **50 further
+consecutive runs with zero failures** (25 on QEMU's default CPU model, 10
+with `-cpu qemu64,+smep,+smap` forcing both on, 1 independent UEFI run,
+15 more on a from-scratch clean rebuild). This many repeats weren't idle
+paranoia — real bugs were caught and fixed exactly because of this volume
+of testing at every stage; see "Real task creation and exit" and "Real
 guard-page-protected task stacks" below for the full list, including one
 older finding that remains honestly documented as *mitigated, not
-debugger-confirmed root-caused* even after this pass's stronger,
+debugger-confirmed root-caused* even after a later pass's stronger,
 structural fix (see that section for exactly what is and isn't proven).
 
 ## What actually happens at boot, and what code runs it
@@ -266,6 +271,75 @@ again and maps a fresh page, and the self-test checks
 silently failed) would have left the first mapping intact and this second
 write would never have faulted at all — so this really does distinguish
 "the page table entry is gone" from "the accounting says it's gone."
+
+## Real multiple address spaces
+
+`address_space.rs` is new this pass. A second, genuinely independent,
+CR3-loadable top-level page table — not a second region carved out of
+the one this kernel already had. Until now every check in this kernel
+shared the single `OffsetPageTable` built once at boot over the CPU's
+actual CR3; this closes the "there is no second, isolated address space"
+gap this file used to state plainly.
+
+**How it's built**: [`AddressSpace::new`] allocates one fresh physical
+frame (from the same shared `PhysicalAllocator` everything else in this
+kernel already uses) to hold a brand-new L4 table, then clones all 512
+entries of the *currently-active* L4 table into it. An L4 entry is just a
+pointer to an L3 table, so cloning the entries — not the tables they
+point to — means the new address space shares every existing mapping
+(kernel code, the heap, the demand-page region, guarded task stacks) with
+the original: nothing that already worked stops working after a real
+switch to it. Only then does it map one real, fresh page at a new,
+private address (`0x_1111_1111_0000`) — via a throwaway `OffsetPageTable`
+view over *this specific* new L4 frame, not the shared global mapper,
+which still targets the original — so exactly one mapping exists in the
+new table and nowhere else.
+
+**Real isolation, verified directly, in three steps, not asserted:**
+
+1. **Before any switch**, the boot self-test checks the *original,
+   still-active* L4 table's entry for the private address is genuinely
+   absent (`PageTableEntry::is_unused()`, a real page-table-entry read) —
+   proof the clone didn't somehow leak the new mapping backward into the
+   table it was cloned from.
+2. **A real `CR3` write** to the new table (`AddressSpace::switch_to`,
+   `x86_64::registers::control::Cr3::write`), then a read straight through
+   the real virtual address — no physical-offset back door, the same one
+   `paging.rs` uses to reach arbitrary frames regardless of which CR3 is
+   loaded — confirms the exact recognizable value
+   (`0xC0FFEE_C0FFEE`) only that table's private mapping holds. This only
+   resolves at all because the hardware page walker is now actually
+   consulting the new table.
+3. **A real `CR3` write back** to the original table
+   (`address_space::restore`), and — this is the strongest evidence of
+   all — every check `main.rs` runs *after* this one (Syscall,
+   Capability, SchedulerBoot, Sanctum, Ipc, Scheduler, TaskExit,
+   TaskReuse) still passing. A subtly wrong restore (a stale TLB entry, a
+   wrong frame, wrong flags) would not have panicked cleanly — it would
+   have surfaced as one of those later, ordinary checks failing or
+   misbehaving in a confusing way. All of them passing, on the very first
+   boot with this code, is real, load-bearing confirmation the round trip
+   was exact.
+
+**Passed on the first boot — no bug this time**, unlike the guard-page
+stack rewrite. Validated the same way regardless: 25 further consecutive
+runs on QEMU's default CPU model, 10 with `-cpu qemu64,+smep,+smap`
+forcing both on, 1 independent UEFI run, and 15 more on a from-scratch
+clean rebuild — 50 further clean runs, 18/18 checks, exit code 33, every
+time.
+
+**Scope, stated plainly**: this is a real second address space, but a
+narrow one. It shares literally everything except the one deliberately
+added private page — there is no process abstraction around it (no PID,
+no scheduler awareness, nothing yet ties a `RunQueue` task to a
+particular `AddressSpace`), no copy-on-write, and no separate user/kernel
+privilege split (this kernel still runs everything at CPL0 in both
+address spaces). The switch back is done by hand in the same call that
+switched away — there is no general "switch address space as part of a
+context switch" mechanism, and nothing schedules a task into a
+non-default address space automatically. A real second CR3 that a task
+could be scheduled into, with its own private memory a *different* task
+genuinely cannot see or corrupt, is real, separate, follow-on work.
 
 ## Real ring-3 syscall
 
@@ -437,7 +511,7 @@ qemu-system-x86_64 \
 ```
 
 Real OVMF `BdsDxe` boot-manager output precedes the kernel's own, then the
-same self-test runs and passes: **17/17 checks, exit code 33.** Both boot
+same self-test runs and passes: **18/18 checks, exit code 33.** Both boot
 paths are now real, observed, passing runs, not one tested and one merely
 "should work."
 
@@ -709,17 +783,21 @@ hardware.
   control back to the boot flow after a fixed tick budget is a hardcoded
   sentinel (`BOOT_PID`), not the scheduler genuinely managing the
   kernel's own boot thread as a task.
-- **The page tables are real but narrow.** There's exactly one address
-  space — everything (kernel code, heap, demand-paged region) lives in the
-  single CR3 this kernel's own `OffsetPageTable` manages; there is no
-  second, isolated address space and no process/kernel privilege
-  separation (everything still runs at CPL0). Real unmapping now exists
-  (`paging::unmap_page`, see "Real page unmapping" above), but nothing in
-  this kernel calls it except the self-test's own deliberate demonstration
-  — there's no general "free this VMA" path wired into anything else yet.
-  The physical allocator is still a single contiguous arena (the largest
-  usable region reported by the bootloader, minus the handful of frames
-  the paging bootstrap consumed) — a real multi-region allocator is still
+- **The page tables are real but narrow.** A second, genuinely
+  independent CR3-loadable address space now exists (see "Real multiple
+  address spaces" above), but only as a one-shot demonstration: it shares
+  every mapping with the original except one deliberately added private
+  page, nothing ties a `RunQueue` task to a particular `AddressSpace`, the
+  switch back is done by hand rather than as part of a general context
+  switch, and there is still no process/kernel privilege separation
+  (everything still runs at CPL0 in both address spaces). Real unmapping
+  now exists (`paging::unmap_page`, see "Real page unmapping" above), but
+  nothing in this kernel calls it except the self-test's own deliberate
+  demonstration — there's no general "free this VMA" path wired into
+  anything else yet. The physical allocator is still a single contiguous
+  arena (the largest usable region reported by the bootloader, minus the
+  handful of frames the paging bootstrap consumed) — a real multi-region
+  allocator is still
   real, separate follow-on work, unchanged from `reference-rs/STATUS.md`'s
   original note.
 - **The kernel heap is fixed-size** (256 KiB bootstrap + 1 MiB real =

@@ -41,6 +41,21 @@ pub const DEMAND_PAGE_REGION_END: u64 = DEMAND_PAGE_REGION_START + 4096;
 static MAPPER: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
 static PHYS: Mutex<Option<PhysicalAllocator>> = Mutex::new(None);
 
+/// The real offset the bootloader mapped all physical memory at
+/// (`BootInfo::physical_memory_offset`), stashed once by [`init`] so later
+/// code (`address_space.rs`) can reach an *arbitrary* physical frame — in
+/// particular, a freshly allocated frame destined to become a second,
+/// independent L4 table — the same way [`active_level_4_table`] already
+/// does for the boot-time one, without needing `main.rs` to thread the
+/// value through every call site.
+static PHYS_MEM_OFFSET: Mutex<Option<VirtAddr>> = Mutex::new(None);
+
+/// The real offset the bootloader mapped all physical memory at, if
+/// [`init`] has already run. See [`PHYS_MEM_OFFSET`]'s docs.
+pub fn phys_mem_offset() -> Option<VirtAddr> {
+    *PHYS_MEM_OFFSET.lock()
+}
+
 /// Reads CR3 and returns a mutable reference to the active level-4 page
 /// table, reached through the bootloader's physical-memory mapping. Real
 /// hardware state, not a copy — every entry written through this
@@ -50,8 +65,9 @@ static PHYS: Mutex<Option<PhysicalAllocator>> = Mutex::new(None);
 /// Caller must ensure `physical_memory_offset` is the real offset the
 /// bootloader mapped all physical memory at, and must not alias this
 /// reference (only ever call once and hold the single resulting
-/// `OffsetPageTable`).
-unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
+/// `OffsetPageTable`) — except for a brief, read-only borrow to clone its
+/// entries elsewhere (`address_space.rs`), which never writes through it.
+pub(crate) unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
     let (level_4_frame, _) = Cr3::read();
     let phys = level_4_frame.start_address();
     let virt = physical_memory_offset + phys.as_u64();
@@ -68,6 +84,7 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 /// Caller must ensure `physical_memory_offset` is the real offset the
 /// bootloader mapped physical memory at, and this must run exactly once.
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+    *PHYS_MEM_OFFSET.lock() = Some(physical_memory_offset);
     let level_4_table = unsafe { active_level_4_table(physical_memory_offset) };
     unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
 }
