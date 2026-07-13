@@ -24,10 +24,31 @@
 //! (copying `USER_PROGRAM` in) is wrapped in real `stac`/`clac`, and this
 //! was verified by actually removing that wrapping and observing a real,
 //! reproducible boot-time page fault before restoring it — see
-//! `STATUS.md`. SMEP, by contrast, is enabled but not empirically fault-
-//! tested this pass: the kernel never attempts to execute from a user-
-//! accessible page anywhere in this codebase, so there is no real trap to
-//! trigger and recover from yet, only a real, read-back-confirmed CR4 bit.
+//! `STATUS.md`.
+//!
+//! **SMEP is now empirically fault-tested too, manually, the same way SMAP
+//! was.** Nothing in the checked-in codebase attempts a supervisor-mode
+//! instruction fetch from a user-accessible page — this kernel has no
+//! reason to — so there's no permanent, always-passing self-test for it,
+//! the same reasoning that already applies to SMAP's break-and-restore
+//! check. Instead this was verified once, manually: a temporary probe
+//! mapped a fresh `USER_ACCESSIBLE` page holding a single `ret` byte and
+//! called directly into it from ring 0 (a plain `call`, no `iretq`, no
+//! privilege change — deliberately *not* going through `syscall.rs`'s
+//! ring-3 machinery, to isolate SMEP from SMAP/interrupt-gate concerns).
+//! With `-cpu qemu64,+smep` (no `+smap`, so the earlier write itself
+//! wouldn't also fault and confuse the result) this produced a real,
+//! immediate `#PF`:
+//! ```text
+//! EXCEPTION: PAGE FAULT at 0x222222220000, error PageFaultErrorCode(PROTECTION_VIOLATION | INSTRUCTION_FETCH) — outside the demand-page region, cannot recover
+//! ```
+//! with `instruction_pointer` reported as that exact address — the fetch
+//! itself faulted before executing a single instruction there. On QEMU's
+//! default CPU model (SMEP unsupported, so `init` above never sets the
+//! bit) the identical probe ran the `ret` and returned harmlessly, as
+//! expected. The probe was then fully removed and the kernel rebuilt back
+//! to a clean, 0-warning, 17/17-passing state — see `STATUS.md` for the
+//! exact captured output on both configurations.
 
 use core::arch::x86_64::__cpuid;
 use core::sync::atomic::{AtomicBool, Ordering};

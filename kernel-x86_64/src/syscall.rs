@@ -22,8 +22,10 @@
 //! into the user code page (copying `USER_PROGRAM` in, below) is wrapped
 //! in real `stac`/`clac` so it survives real `CR4.SMAP` being set. SMEP
 //! itself (forbidding the *kernel* from executing user-accessible pages)
-//! is enabled but has no real trap to trigger in this codebase — the
-//! kernel never attempts it anywhere.
+//! is enabled and was empirically fault-tested manually (see
+//! `cpu_features.rs`'s module docs and `STATUS.md`), but nothing in this
+//! codebase — including this module — ever attempts it as part of normal
+//! operation.
 //!
 //! ## The mechanism
 //!

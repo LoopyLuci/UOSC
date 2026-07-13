@@ -360,12 +360,39 @@ one, so the ordering is load-bearing.
   real flag only if CPUID actually confirmed support. The ring-3 demo's
   *code* page deliberately keeps NX off, since real ring-3 code has to
   actually execute out of it every boot.
-- **SMEP** is enabled (via a real, CPUID-gated `CR4` write) but has no
-  real trap to trigger in this codebase — the kernel never attempts to
-  execute an instruction from a user-accessible page anywhere. Verified
-  only as "the real bit is set when CPUID says it's supported" (the
-  `CpuSecurity` check below), not empirically fault-tested. Said plainly
-  rather than silently claimed as more than it is.
+- **SMEP** is enabled (via a real, CPUID-gated `CR4` write) and, this
+  pass, empirically fault-tested manually — the same way SMAP's fix was
+  verified, and for the same reason it isn't a permanent, always-passing
+  self-test: nothing in the checked-in codebase attempts a supervisor-mode
+  instruction fetch from a user-accessible page, so there's no recoverable
+  fault to build a passing check around. A temporary probe (removed after
+  capturing the result) mapped a fresh `USER_ACCESSIBLE` page holding a
+  single `ret` byte and called directly into it from ring 0 — a plain
+  `call`, not `iretq`, deliberately bypassing `syscall.rs`'s ring-3
+  machinery entirely so the result couldn't be confused with a SMAP or
+  interrupt-gate effect. Booting with `-cpu qemu64,+smep` (SMAP
+  deliberately *not* forced this time, so the probe's own write to that
+  page wouldn't also fault) produced a real, immediate fault:
+  ```
+  [PANIC] panicked at src\interrupts.rs:108:5:
+  EXCEPTION: PAGE FAULT at 0x222222220000, error PageFaultErrorCode(PROTECTION_VIOLATION | INSTRUCTION_FETCH) — outside the demand-page region, cannot recover
+  InterruptStackFrame {
+      instruction_pointer: VirtAddr(0x222222220000),
+      ...
+  }
+  ```
+  — `instruction_pointer` landing exactly on the probe address is real,
+  direct evidence the fetch itself was blocked before executing a single
+  instruction there, not a side effect of something else. On QEMU's
+  default CPU model (SMEP unsupported, so `cpu_features::init` never sets
+  the bit) the identical probe ran the `ret` and returned harmlessly:
+  ```
+  [smep_probe] TEMP: about to call ring-0 into a user-accessible page at 0x222222220000
+  [smep_probe] TEMP: returned from the user-accessible page without faulting
+  ```
+  The probe was then fully reverted and the kernel rebuilt back to a
+  clean, 0-warning, 17/17-passing state on both configurations before any
+  further validation.
 - **SMAP** *is* genuinely exercised: `syscall.rs`'s one real kernel write
   into a user-accessible page (copying the hand-assembled `USER_PROGRAM`
   into the freshly mapped code page) is wrapped in real `stac`/`clac`
@@ -710,12 +737,15 @@ hardware.
   no general syscall ABI or process model behind it, and the live
   self-test output says so rather than silently marking the phase done.
 - **NX/SMEP/SMAP are real but narrow.** NX and SMAP are both genuinely
-  enforced and empirically exercised (see "Real NX/SMEP/SMAP" above); SMEP
-  is enabled and CPUID-gated correctly but has no real fault-and-recover
-  test in this codebase, since the kernel never attempts what it would
-  catch. No page carries a fine-grained read-only/read-write distinction
-  beyond what already existed (every mapped page here is still
-  `WRITABLE`); no protection-key (`PKU`) support; no CET/shadow stacks.
+  enforced and empirically exercised every boot (see "Real NX/SMEP/SMAP"
+  above); SMEP is enabled, CPUID-gated correctly, and this pass was
+  empirically fault-tested too — but only manually, once, via a temporary
+  probe that was reverted afterward, not a permanent self-test, since
+  nothing in the checked-in kernel actually attempts a supervisor-mode
+  fetch from a user-accessible page. No page carries a fine-grained
+  read-only/read-write distinction beyond what already existed (every
+  mapped page here is still `WRITABLE`); no protection-key (`PKU`)
+  support; no CET/shadow stacks.
 - **No filesystem, no network, no SMP.**
 - **Not RISC-V, not AArch64, not on real (non-emulated) hardware.** QEMU is
   a real, high-fidelity emulator, not a rubber stamp — but it is not a
