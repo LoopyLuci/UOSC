@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "uosc-core"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reference implementation of UOSC's portable kernel logic (capability model, memory allocator, scheduler, IPC), kept in sync with the Titan specification."
+license = "MIT"
+
+[lib]
+name = "uosc_core"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
+
+[profile.dev]
+panic = "unwind"
