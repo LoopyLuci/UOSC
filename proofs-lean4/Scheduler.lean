@@ -8,52 +8,25 @@ Scope, stated up front: this file proves no-starvation for **two** competing
 Normal-class tasks, for *any* starting vruntimes and *any* positive
 vruntime increment. That is the real mathematical mechanism behind CFS
 fairness — the task that's behind always eventually gets picked, because
-picking it is what stops it from falling further behind. The n-task case
-(arbitrary queue size) is exercised empirically, not proved here, by
+picking it is what stops it from falling further behind.
+
+**The general n-task case is now proved too — see `SchedulerN.lean` in this
+same directory.** A first pass through this file left it as a written-out,
+not-yet-machine-checked argument, on the reasoning that generalizing this
+proof's single-opponent comparison naively (pick some other task `j` and
+track the `t`-vs-`j` gap) breaks under tie-breaking: if `j` ties with `t`
+and loses the tie, `j` can be re-picked without the gap ever closing, and
+nothing in a single-opponent argument bounds how long that can recur. The
+fix that made it through to a real proof was to stop comparing `t` against
+one opponent and instead sum headroom across *all* other tasks at once
+(`SchedulerN.lean`'s `phi`), paired with a tie-count that strictly drops
+every time a genuinely-tied opponent is retired
+(`SchedulerN.lean`'s `tieCount`) — see that file's header for the full
+argument and `measureM_decreases_on_step` for where the two cases meet.
 `scheduler.rs`'s existing `no_normal_task_starves_for_arbitrary_task_counts`
-property test (256 random cases, up to 12 tasks).
-
-**The general n-task argument, worked out but not (yet) machine-checked**:
-naively generalizing the two-task proof by picking some other single task
-`j` to compare against `t` doesn't work — if `j` ties with `t` and loses
-the tie-break, `j` can be re-picked without the `t`-vs-`j` gap closing at
-all, and nothing in a single-opponent argument bounds how long that can
-recur. The fix is to stop comparing `t` against one opponent and instead
-track `restMin(vs, t) := min { vs[i] | i ≠ t }`, the minimum over
-*everyone else*. Two facts make this work where the pairwise approach
-didn't:
-
-1. `restMin` is non-decreasing over time, full stop — every step increments
-   exactly one entry by `inc` and never decreases anything, so the minimum
-   of any fixed subset of entries can only rise or hold.
-2. `restMin` cannot *hold* for more than `n - 1` consecutive steps that
-   don't pick `t`: each such step increments whichever other task is
-   currently *at* `restMin`; once incremented, that task can never return
-   to `restMin` (monotonicity again), so it's permanently retired from the
-   set of tasks still capable of holding `restMin` at its current value.
-   There are at most `n - 1` other tasks to retire, so `restMin` must
-   strictly increase (by at least `inc`) within `n - 1` steps of not
-   picking `t`.
-
-Together: as long as `vs[t] > restMin`, repeat "at most `n-1` steps" rounds,
-each provably increasing `restMin` by at least `inc`, until
-`vs[t] ≤ restMin` — at which point `t` is (tied-for-)minimal and must be
-picked. This gives an explicit bound, `(n - 1) * ⌈(vs[t] - restMin₀) / inc⌉`
-steps, generalizing the two-task proof's single-opponent bound exactly the
-way you'd hope. It avoids the tie-break trap because `restMin` bundles all
-`n - 1` opponents into one monovariant instead of tracking one at a time.
-
-This is a complete, correct argument, not a hand-wave — but turning it into
-Lean means representing `restMin` over a `List Nat` with position identity
-preserved across `List.set` updates, and the "at most `n-1` retirements"
-step needs its own bounded induction over a shrinking finite set of
-not-yet-retired indices. That's real, additional proof engineering on top
-of what's in this file, with a real chance of hitting the same class of
-fiddly index/`List` lemma issues the two-task proof needed several
-iterations to resolve — attempting it inside this pass risked leaving
-something half-finished or subtly wrong with no compiler run left to catch
-it. Recorded here precisely enough that finishing it is a bounded,
-well-defined follow-on task, not an open question.
+property test (256 random cases, up to 12 tasks) remains the empirical
+cross-check that this formal model matches what the Rust scheduler
+actually does.
 -/
 
 /-- One CFS scheduling step for two tasks: whichever has the smaller (or

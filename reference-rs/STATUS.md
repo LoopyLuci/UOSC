@@ -20,7 +20,7 @@ cargo build --lib             → compiles clean under #![no_std] (no warnings)
 cargo test                    → 64 passed; 0 failed
 cargo test --release          → 64 passed; 0 failed (same result under optimization)
 cargo clippy --all-targets -- -W clippy::all   → 0 warnings
-lean Capability.lean / Memory.lean / Scheduler.lean / Boot.lean / PageFault.lean   → all five exit 0 (proofs-lean4/)
+lean Capability.lean / Memory.lean / Scheduler.lean / SchedulerN.lean / Boot.lean / PageFault.lean   → all six exit 0 (proofs-lean4/)
 ```
 
 Eight modules now, each a real port of one `.ti` file's portable-logic
@@ -47,14 +47,18 @@ once, in order.
 `../proofs-lean4/` re-hosts 8 of the 10 numbered properties from
 `kernel_security.ax` in actual Lean 4 (toolchain: `elan` 4.2.3 /
 `lean` 4.31.0, installed via `scoop install elan`), checked against formal
-models built to mirror what this crate's Rust code actually does:
+models built to mirror what this crate's Rust code actually does — one of
+those eight (Property 5) now has *two* independent proofs:
 
 - Property 1 (`process_capability_confinement`)
 - Property 2 (`memory_process_isolation`)
 - Property 3 (`capability_revocation_effective`)
-- Property 5 (`scheduler_no_starvation`) — **two-task case**; see
-  `proofs-lean4/Scheduler.lean`'s header for a complete, worked-out — but
-  not yet formalized — argument for the general n-task case
+- Property 5 (`scheduler_no_starvation`) — **both** the two-task instance
+  (`Scheduler.lean`) **and** the fully general n-task case, any number of
+  tasks, any adversarial tie-break policy (`SchedulerN.lean`) — the latter
+  was flagged in an earlier pass as "worked out but not yet formalized";
+  it's now formalized, via a combined headroom-sum-and-tie-count measure
+  that strictly decreases every step
 - Property 7 (`page_fault_handler_correctness`) — **the spec's literal
   two-way claim is false**; `proofs-lean4/PageFault.lean` proves a
   concrete counterexample and the real three-way characterization that
@@ -68,9 +72,8 @@ models built to mirror what this crate's Rust code actually does:
   referent at all (see bug #7)
 
 Full detail, including exactly what's NOT covered and why (Properties 4, 6,
-the n-task half of 5, and the excluded half of 8), is in
-`../proofs-lean4/README.md` — this is not "10/10 done," and that file says
-so explicitly.
+and the excluded half of 8), is in `../proofs-lean4/README.md` — this is
+not "10/10 done," and that file says so explicitly.
 
 ## Real bugs found in the Titan specification while porting it
 
@@ -158,17 +161,18 @@ of these were invisible until now:
   executes `asm!("vmcall")`/`asm!("syscall")`/MSR reads with no
   computation to get right or wrong; the driver files are almost entirely
   MMIO/port I/O. There was nothing portable-logic-shaped to port.
-- **The ten theorems in `proofs/kernel_security.ax` are now 8/10
-  mechanically re-hosted** in `../proofs-lean4/` (Lean 4, no Mathlib,
-  real `lean` compiler runs, not hand-waved). The remaining 2 — full
-  detail in `proofs-lean4/README.md` — are Properties 4
-  (`ipc_message_atomicity`) and 6 (`interrupt_handler_safety`), both of
-  which need a real operational semantics of hardware/concurrency this
-  codebase doesn't model; `ipc.rs`'s real concurrent-thread test is the
-  empirical evidence this codebase has for Property 4 instead. Property
-  5's n-task case (only the two-task case is formally proved) and
-  Property 8's signature/PKI half are also not covered — see
-  `proofs-lean4/README.md` for exactly why in each case.
+- **8 of the 10 theorems in `proofs/kernel_security.ax` are now mechanically
+  re-hosted** in `../proofs-lean4/` (Lean 4, no Mathlib, real `lean`
+  compiler runs, not hand-waved) — Property 5 has two independent proofs
+  (two-task and general n-task), which is why six `.lean` files cover eight
+  property numbers. The remaining 2 — full detail in
+  `proofs-lean4/README.md` — are Properties 4 (`ipc_message_atomicity`) and
+  6 (`interrupt_handler_safety`), both of which need a real operational
+  semantics of hardware/concurrency this codebase doesn't model and has no
+  code referent for; `ipc.rs`'s real concurrent-thread test is the
+  empirical evidence this codebase has for Property 4 instead. Property 8's
+  signature/PKI half is also not covered — see `proofs-lean4/README.md` for
+  why.
 - **Cascading capability revocation is not implemented.** Demonstrated,
   not hidden, by `capability::tests::revoking_source_does_not_touch_an_independently_issued_delegate_token`
   and its Lean mirror, `Capability.lean`'s
@@ -192,13 +196,13 @@ implementation, real proof-checking, and a real test suite. This pass now
 delivers meaningful coverage of all three — 8 of UOSC's ~11 kernel/driver
 files have a real ported logic subset, 8 of 10 specified theorems have a
 real machine-checked result (one of which is a proof that the theorem as
-originally stated is false), and 64 tests (up from the previous pass's 33)
-back all of it. It is still not complete: 3 files have zero portable logic
-to port and are honestly excluded rather than faked, 2 theorems (Properties
-4 and 6) remain unformalized because they need machinery this codebase
-doesn't have, and 2 more are partial (Property 5's n-task case has a
-complete written-out argument but isn't yet machine-checked; Property 8's
-signature/PKI half isn't modeled). No hardware bring-up has been attempted
-at all. Extending further — the n-task scheduler proof, an interrupt
-operational semantics, a PKI model for delegation authenticity — is real,
-substantial, separate work.
+originally stated is false, and one of which — the scheduler — is proved
+for both a two-task instance and the fully general n-task case), and 64
+tests (up from the original pass's 33) back all of it. It is still not
+complete: 3 files have zero portable logic to port and are honestly
+excluded rather than faked, 2 theorems (Properties 4 and 6) remain
+unformalized because they need hardware/concurrency machinery this codebase
+doesn't have and has no code referent for, and Property 8's signature/PKI
+half isn't modeled. No hardware bring-up has been attempted at all.
+Extending further — a real interrupt operational semantics, a PKI model for
+delegation authenticity — is real, substantial, separate work.
