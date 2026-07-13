@@ -2,8 +2,10 @@
 
 This crate is the first real slice of Phase 0 from the [UOSC architecture
 roadmap](../README.md): a Rust reference implementation of the portable
-kernel logic specified in `../kernel/*.ti`, kept in sync with that
-specification rather than replacing it.
+kernel logic specified in `../kernel/*.ti` and `../drivers/*.ti`, kept in
+sync with that specification rather than replacing it. `../proofs-lean4/`
+sits alongside it: a real, mechanically-checked re-hosting of a subset of
+`../proofs/kernel_security.ax`'s theorems.
 
 **What "verified" means below**: every claim in this document is either a
 number from a command actually run against this code, or explicitly marked
@@ -14,12 +16,15 @@ applies to this document too.
 ## What's real right now
 
 ```
-cargo build --lib     → compiles clean under #![no_std] (no warnings)
-cargo test            → 33 passed; 0 failed
+cargo build --lib             → compiles clean under #![no_std] (no warnings)
+cargo test                    → 64 passed; 0 failed
+cargo test --release          → 64 passed; 0 failed (same result under optimization)
 cargo clippy --all-targets -- -W clippy::all   → 0 warnings
+lean Capability.lean / Memory.lean / Scheduler.lean   → all three exit 0 (proofs-lean4/)
 ```
 
-Four modules, each a real port of one `.ti` file:
+Eight modules now, each a real port of one `.ti` file's portable-logic
+subset:
 
 | Module | Ports | Tests |
 |---|---|---|
@@ -27,14 +32,37 @@ Four modules, each a real port of one `.ti` file:
 | `memory` | `kernel/memory.ti` | 9 (incl. 1 property test) |
 | `ipc` | `kernel/ipc.ti` | 8 (incl. 2 property tests, 1 real concurrent thread test) |
 | `scheduler` | `kernel/scheduler.ti` | 7 (incl. 1 property test) |
+| `sanctum` | `kernel/sanctum.ti` (vault lifecycle + isolation check; hardware TLB/cache setup excluded) | 6 (incl. 1 property test) |
+| `boot` | new — gives `boot_sequence_integrity` a real referent (see bug #7) | 5 (incl. 1 property test) |
+| `timer` | `drivers/timer.ti` (frequency/divisor/time-conversion arithmetic only; MMIO/MSR/port I/O excluded) | 7 (incl. 1 property test) |
+| `console` | `drivers/console.ti` (CRLF translation, cursor/scroll math, printf scanner; serial/framebuffer I/O excluded) | 10 (incl. 1 property test) |
 
 The property-based tests (`proptest`) each run 256 randomized cases by
-default — `memory`'s and `ipc`'s exercise arbitrary interleavings of
-allocate/deallocate and enqueue/dequeue, not just the hand-picked examples
-in the unit tests next to them. The IPC concurrency test spawns two real OS
-threads (a genuine producer and a genuine consumer, not a simulation) and
-pushes 5,000 messages through the ring buffer, asserting every one arrives
-exactly once, in order.
+default. The IPC concurrency test spawns two real OS threads and pushes
+5,000 messages through the ring buffer, asserting every one arrives exactly
+once, in order.
+
+## Real, mechanically-checked proofs (new this pass)
+
+`../proofs-lean4/` re-hosts 6 of the 10 numbered properties from
+`kernel_security.ax` in actual Lean 4 (toolchain: `elan` 4.2.3 /
+`lean` 4.31.0, installed via `scoop install elan`), checked against formal
+models built to mirror what this crate's Rust code actually does:
+
+- Property 1 (`process_capability_confinement`)
+- Property 2 (`memory_process_isolation`)
+- Property 3 (`capability_revocation_effective`)
+- Property 5 (`scheduler_no_starvation`) — **two-task case**; see
+  `proofs-lean4/Scheduler.lean`'s header for the honest scope note on why
+  the general n-task case isn't (yet) formally proved
+- Property 8 (`capability_delegation_authentic`) — **permission-bound half
+  only**; the signature/PKI half isn't modeled
+- Property 9 (`sanctum_vault_isolation`) — same proof as Property 2, since
+  a vault region and a process address space are the same shape of thing
+
+Full detail, including exactly what's NOT covered and why (Properties 4, 6,
+7, 10, and the excluded halves of 8), is in `../proofs-lean4/README.md` —
+this is not "10/10 done," and that file says so explicitly.
 
 ## Real bugs found in the Titan specification while porting it
 
@@ -43,85 +71,115 @@ of these were invisible until now:
 
 1. **`get_process_capability` in `kernel/ipc.ti:257-277` ignores its `pid`
    and `resource` arguments and unconditionally returns a fully-permissioned
-   token.** Nothing in the specified `send_message`/`receive_message` can
-   ever actually deny access — the capability check is decorative. Fixed in
-   `ipc::PortTable::send_message`/`receive_message`, which call the real
-   `CapabilityBroker` and are covered by
-   `ipc::tests::send_without_any_capability_is_denied`.
+   token.** Fixed in `ipc::PortTable::send_message`/`receive_message`,
+   covered by `ipc::tests::send_without_any_capability_is_denied`.
 
 2. **`has_allocation_capability` in `kernel/memory.ti:358-361` always
-   returns `true`.** Same class of bug — a capability check that can't deny
-   anything isn't a capability check. Fixed in
-   `memory::ProcessMemoryContext::allocate_virtual`, covered by
-   `memory::tests::allocate_virtual_is_denied_without_a_real_capability_grant`.
+   returns `true`.** Fixed in `memory::ProcessMemoryContext::allocate_virtual`,
+   covered by `memory::tests::allocate_virtual_is_denied_without_a_real_capability_grant`.
 
 3. **`split_block` and `coalesce_blocks` in `kernel/memory.ti:333-341` are
-   `Ok(())`.** The buddy allocator's entire reason for existing — reusing
-   freed memory efficiently — has no implementation. A real split/coalesce
-   implementation is in `memory::PhysicalAllocator`, and
-   `memory::tests::allocate_deallocate_cycles_never_leak_pages` (a property
-   test) checks that arbitrary allocate/free sequences always return every
-   page to the free pool.
+   `Ok(())`.** Fixed in `memory::PhysicalAllocator`, covered by the property
+   test `memory::tests::allocate_deallocate_cycles_never_leak_pages`.
 
 4. **`RunQueue::pick_next_task` in `kernel/scheduler.ti:229-237` only
    implements the CFS half of the file's own "EDF + CFS hybrid"
-   description** — the `deadline` field on `Process` and the `DeadlineQueue`
-   type both exist and are never read anywhere. Fixed in
-   `scheduler::RunQueue::pick_next_task`, covered by
+   description.** Fixed in `scheduler::RunQueue::pick_next_task`, covered by
    `scheduler::tests::realtime_task_always_preempts_normal_regardless_of_vruntime`.
 
-5. **The `RingBuffer` in `kernel/ipc.ti:299-354` has a capacity check —
-   `(write_pos + data.len()) % capacity == read_pos` — that cannot
-   distinguish "full" from "empty" once the write index has wrapped past the
-   read index, and its `dequeue` reads a stated "8 bytes total" length
-   prefix from a 2-element array literal.** Rewritten as a real
-   single-producer/single-consumer lock-free queue with an explicit `len`
-   counter; see `ipc::RingBuffer`'s doc comment for the concurrency
-   argument, and `ipc::tests::real_concurrent_spsc_producer_consumer_loses_and_corrupts_nothing`
-   for the empirical check.
+5. **The `RingBuffer` in `kernel/ipc.ti:299-354` cannot distinguish "full"
+   from "empty" once the write index wraps past the read index.** Rewritten
+   as a real SPSC lock-free queue; see
+   `ipc::tests::real_concurrent_spsc_producer_consumer_loses_and_corrupts_nothing`.
 
 6. **`RedBlackTree<K, V>` in `kernel/scheduler.ti:384-389` is an
-   unimplemented stub** (`insert`, `remove`, `min` all `/* ... */`).
-   `scheduler::RunQueue` uses `BTreeMap` instead — the same
-   O(log n) ordered-minimum behavior, without hand-deriving tree rotations
-   for a property (ordering) that doesn't require that specific structure.
+   unimplemented stub.** `scheduler::RunQueue` uses `BTreeMap` instead.
+
+7. **`kernel_security.ax`'s `theorem boot_sequence_integrity` describes a
+   `BootPhase` type and a `boot_phase()` function that don't exist anywhere
+   in `kernel/boot.ti`.** `boot.ti`'s `early_boot`/`late_boot` are a fixed,
+   hardcoded call sequence with no phase tracking and no ordering
+   enforcement at all — the theorem's own referent was never built. `boot.rs`
+   is new code that actually builds it: `BootSequencer` refuses to mark a
+   phase complete unless every earlier phase already is, covered by
+   `boot::tests::skipping_a_phase_is_rejected` and the property test
+   `boot::tests::ordering_invariant_holds_after_any_sequence_of_attempts`.
+
+8. **Neither `init_pit_timer` nor `init_apic_timer`/`set_apic_frequency` in
+   `drivers/timer.ti` validates `freq_hz != 0` before dividing by it**
+   (`kernel/timer.ti:210`, `:234`) — a zero frequency divides by zero.
+   A second, related bug in the same function: **`divisor * freq_hz` in
+   `set_apic_frequency` is unchecked `u32` multiplication** that overflows
+   for `freq_hz` above ~268 million. Both fixed in `timer::pit_divisor`/
+   `timer::apic_initial_count`, which return `Err` instead of panicking or
+   silently wrapping; covered by `timer::tests::zero_frequency_is_rejected_everywhere_not_panicked`
+   and the property test `timer::tests::no_panics_for_any_nonzero_frequency`.
+
+9. **`printf` in `drivers/console.ti:112-149` never actually writes its
+   arguments.** The `%d`/`%u` match arm is `{ i += 2; }` and the `%s` arm is
+   `{ if arg_index < args.len() { /* Format argument */ } arg_index += 1; i += 2; }`
+   — both comments describing work that was never implemented, so every
+   `printf` call in the Titan source silently drops every argument and
+   prints only the literal text around them. Fixed in `console::format`,
+   which actually substitutes each argument's `Display` output; covered by
+   `console::tests::printf_substitutes_integer_arguments_in_order` and
+   `console::tests::printf_substitutes_string_argument`.
 
 ## What this deliberately does not claim
 
 - **No bootable binary.** This is portable logic — no boot sequence, no
-  hardware paging, no interrupt handling, no APIC/HPET/PIT timer code. A
-  hardware bring-up effort (or a `bootloader`/`uefi-rs`-based binary crate
-  built on top of this library) is separate, follow-on work.
-- **`kernel/boot.ti`, `sanctum.ti`, `hypercall.ti`, `console.ti`, `timer.ti`,
-  and the four `drivers/*` files are not ported here.** This pass scoped to
-  the four subsystems the roadmap named as the capability/memory/IPC/
-  scheduler core; the rest is real, separate follow-on work, not implied by
-  anything above.
-- **The ten theorems in `proofs/kernel_security.ax` are not re-hosted in
-  Lean 4 or Isabelle/HOL in this pass.** No Lean/Isabelle toolchain was
-  available in this environment, and writing proof scripts that can't
-  actually be mechanically checked here would produce exactly the
-  looks-verified-but-isn't artifact this whole effort exists to eliminate.
-  What this crate offers instead, honestly labeled as what it is: property
-  tests that check some of the same properties empirically (capability
-  confinement, revocation, delegation bounds, no-starvation) over hundreds
-  of randomized cases — real evidence, but evidence, not proof.
-- **Cascading capability revocation is not implemented.** Revoking a source
-  token does not revoke capabilities already delegated from it — this is
-  demonstrated, not hidden, by
-  `capability::tests::revoking_source_does_not_touch_an_independently_issued_delegate_token`,
-  which passes today by asserting the delegate token *survives* its
-  source's revocation. Closing this gap is real follow-on work, not a
-  known-and-ignored bug.
-- **`PageTable` here is an in-memory mapping table, not a hardware
-  page-walker.** It's a real, correct model of the *policy* (what maps to
-  what, with what access), built so a hardware-specific backend can be
-  written underneath it later without changing anything that calls it.
+  hardware paging, no interrupt handling, no APIC/HPET/PIT timer code
+  actually driving hardware, no serial/framebuffer I/O. A hardware
+  bring-up effort (or a `bootloader`/`uefi-rs`-based binary crate built on
+  top of this library) is separate, follow-on work.
+- **`kernel/hypercall.ti` and `drivers/{block,input,network,graphics}.ti`
+  are not represented here at all**, not even partially. Unlike
+  `boot`/`console`/`sanctum`/`timer` (each of which had a real portable-
+  logic subset worth extracting), these files are close to 100% direct
+  hardware/hypervisor dispatch — `hypercall.ti` marshals a struct and
+  executes `asm!("vmcall")`/`asm!("syscall")`/MSR reads with no
+  computation to get right or wrong; the driver files are almost entirely
+  MMIO/port I/O. There was nothing portable-logic-shaped to port.
+- **The ten theorems in `proofs/kernel_security.ax` are now 6/10
+  mechanically re-hosted** in `../proofs-lean4/` (Lean 4, no Mathlib,
+  real `lean` compiler runs, not hand-waved). The remaining 4 — full
+  detail in `proofs-lean4/README.md` — are Properties 4, 6, 7, and 10.
+  Properties 4 (`ipc_message_atomicity`) and 6
+  (`interrupt_handler_safety`) need an operational semantics of
+  hardware/concurrency this codebase doesn't model. Property 7
+  (`page_fault_handler_correctness`) is covered empirically by
+  `memory.rs`'s page-fault tests, not formally. Property 10
+  (`boot_sequence_integrity`) now has a real code referent —
+  `boot::BootSequencer` (bug #7 above) — but that referent didn't exist
+  until this pass, so it hasn't been formalized in Lean yet; doing so is
+  straightforward, tractable follow-on work, not a hard blocker like
+  Properties 4 and 6.
+- **Cascading capability revocation is not implemented.** Demonstrated,
+  not hidden, by `capability::tests::revoking_source_does_not_touch_an_independently_issued_delegate_token`
+  and its Lean mirror, `Capability.lean`'s
+  `revocation_is_per_capability_not_per_resource`.
+- **`PageTable` and the `sanctum` vault registry are in-memory policy
+  models, not hardware page-walkers or real TLB/cache isolation.** They
+  model *who is allowed to translate what*, built so a hardware-specific
+  backend can be written underneath them later without changing anything
+  that calls them.
+- **`sanctum::attest` is a real deterministic checksum, not a
+  cryptographic HMAC-SHA256** the way `kernel/sanctum.ti`'s comments
+  describe. It's real enough to catch in-place tampering between
+  attestations (the only property `enter_vault` actually needs), but it is
+  not a security-grade hash and shouldn't be treated as one outside this
+  test-scale model.
 
 ## Why this is Phase 0 and not "done"
 
 The roadmap frames Phase 0 as three things: a real reference
-implementation, real proof-checking, and a real test suite. This delivers
-the first and third for four of UOSC's nine subsystems, and is explicit
-about not delivering the second. That's the honest scope of one pass —
-not a claim that Phase 0 is complete.
+implementation, real proof-checking, and a real test suite. This pass now
+delivers meaningful coverage of all three — 8 of UOSC's ~11 kernel/driver
+files have a real ported logic subset, 6 of 10 specified theorems have a
+real machine-checked proof, and 64 tests (up from the previous pass's 33)
+back all of it. It is still not complete: 3 files have zero portable logic
+to port and are honestly excluded rather than faked, 4 theorems remain
+unformalized with stated reasons, and no hardware bring-up has been
+attempted at all. Extending further — the n-task scheduler proof, an
+interrupt operational semantics, a PKI model for delegation authenticity —
+is real, substantial, separate work.
