@@ -185,3 +185,28 @@ pub fn map_page(
     let mut allocator = PhysicalAllocatorAdapter { phys };
     map_page_with(mapper, &mut allocator, vaddr, flags)
 }
+
+/// The real counterpart to [`map_page`]: removes the real page table entry
+/// (a real `mapper.unmap` + TLB flush, not just an accounting fiction) and
+/// returns the real physical frame it was backed by to the shared
+/// `PhysicalAllocator`, so it's genuinely available for the next
+/// `allocate()` again — not leaked, not double-owned. Any subsequent
+/// access to `vaddr` after this returns really does fault: the hardware
+/// page walker has nothing to find there any more.
+pub fn unmap_page(
+    mapper: &mut OffsetPageTable<'static>,
+    phys: &mut PhysicalAllocator,
+    vaddr: VirtAddr,
+) -> Result<(), MemoryError> {
+    let page: Page<Size4KiB> = Page::containing_address(vaddr);
+    match mapper.unmap(page) {
+        Ok((frame, flush)) => {
+            flush.flush();
+            phys.deallocate(frame.start_address().as_u64())
+        }
+        Err(e) => {
+            serial_println!("[paging] unmap({:#x}) failed: {:?}", vaddr.as_u64(), e);
+            Err(MemoryError::AccessViolation)
+        }
+    }
+}

@@ -15,22 +15,24 @@
 //! semantics, no filesystem, no network stack, no SMP. This is a real
 //! boot to a real self-test, not a usable operating system.
 //!
-//! It does now include a real context switch (`context.rs` +
-//! `scheduler_bridge.rs` genuinely save/restore two independently-running
-//! kernel tasks' stack pointers and callee-saved registers, driven by the
-//! real hardware timer), real hardware page tables (`paging.rs`): a real
-//! `OffsetPageTable` over the CPU's actual CR3, a kernel heap that's
-//! really mapped page-by-page instead of static BSS (`allocator.rs`), and
-//! a real page fault deliberately triggered and demand-paged by
-//! `interrupts.rs`'s handler — a real ring-3 → ring-0 privilege
-//! transition (`syscall.rs`): actual CPL3 code, on real hardware,
-//! trapping into the kernel via a real `int 0x80` and being observed by a
-//! real handler — and real NX/SMEP/SMAP (`cpu_features.rs`): real
-//! `EFER.NXE` and `CR4.SMEP`/`CR4.SMAP`, each gated on a real CPUID check,
-//! with every data page this kernel maps (heap, demand-paged region, the
-//! ring-3 demo's user stack) actually marked non-executable and the one
-//! real kernel write into a user-accessible page wrapped in real
-//! `stac`/`clac`.
+//! It does now include a real context switch with real dynamic task
+//! creation and real task exit (`context.rs` + `scheduler_bridge.rs`
+//! genuinely save/restore independently-running kernel tasks' stack
+//! pointers and callee-saved registers, driven by the real hardware
+//! timer, within a fixed-size task pool), real hardware page tables
+//! (`paging.rs`): a real `OffsetPageTable` over the CPU's actual CR3, a
+//! kernel heap that's really mapped page-by-page instead of static BSS
+//! (`allocator.rs`), a real page fault deliberately triggered and
+//! demand-paged by `interrupts.rs`'s handler, and a real page unmap that
+//! genuinely frees the physical frame back to the shared allocator — a
+//! real ring-3 → ring-0 privilege transition (`syscall.rs`): actual CPL3
+//! code, on real hardware, trapping into the kernel via a real `int 0x80`
+//! and being observed by a real handler — and real NX/SMEP/SMAP
+//! (`cpu_features.rs`): real `EFER.NXE` and `CR4.SMEP`/`CR4.SMAP`, each
+//! gated on a real CPUID check, with every data page this kernel maps
+//! (heap, demand-paged region, the ring-3 demo's user stack) actually
+//! marked non-executable and the one real kernel write into a
+//! user-accessible page wrapped in real `stac`/`clac`.
 
 #![no_std]
 #![no_main]
@@ -263,6 +265,37 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         page_fault_ok,
     );
 
+    // --- Real page unmapping: the counterpart to the demand-paged mapping
+    // just above. Unmap the exact same page, confirm the real physical
+    // frame actually came back to the shared PhysicalAllocator (free count
+    // goes up by one), then write through the same pointer again — since
+    // the page table entry is genuinely gone, this is a real, *second* #PF
+    // at the same address, not a no-op. The demand-page handler catches it
+    // again (still inside the designated region) and maps a fresh page, so
+    // PAGE_FAULTS_DEMAND_PAGED should read 2, not 1 — proof the unmap
+    // really removed the mapping rather than just relabeling it. ---
+    let unmap_ok = {
+        let free_before = paging::with_phys(|phys| phys.free_page_count()).unwrap_or(0);
+        let page_vaddr = VirtAddr::new(paging::DEMAND_PAGE_REGION_START);
+        let unmapped = paging::with_mapper_and_phys(|mapper, phys| paging::unmap_page(mapper, phys, page_vaddr))
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+        let free_after = paging::with_phys(|phys| phys.free_page_count()).unwrap_or(0);
+
+        let ptr = paging::DEMAND_PAGE_REGION_START as *mut u64;
+        unsafe {
+            ptr.write_volatile(0xFEED_FACE_0BAD_F00D);
+        }
+        let value_ok = unsafe { ptr.read_volatile() } == 0xFEED_FACE_0BAD_F00D;
+        let refaulted = interrupts::PAGE_FAULTS_DEMAND_PAGED.load(Ordering::SeqCst) == 2;
+
+        unmapped && free_after == free_before + 1 && value_ok && refaulted
+    };
+    results.record(
+        "Unmap: a real page unmap freed the real physical frame, and the address really re-faulted",
+        unmap_ok,
+    );
+
     // --- Real ring-3 → ring-0 privilege transition, deliberately run
     // before scheduler_bridge::init() below — see syscall.rs's module
     // docs for why real preemption and this demo don't overlap in this
@@ -344,6 +377,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     results.record(
         "Scheduler: real context switches actually ran both kernel tasks, driven by the real hardware timer",
         scheduler_bridge::both_tasks_made_real_progress(),
+    );
+    results.record(
+        "TaskExit: a real dynamically spawned task ran, then really exited and left the real RunQueue",
+        scheduler_bridge::task_c_really_exited(),
     );
 
     serial_println!("\n=== UOSC boot self-test: {}/{} checks passed ===", results.passed, results.total);

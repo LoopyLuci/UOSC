@@ -52,19 +52,20 @@ UOSC x86-64 — real boot starting
 [PASS] Paging: real kernel heap, mapped through real hardware page tables, holds real data
 [page_fault] real #PF at 0x555555550000, demand-paged and resumed
 [PASS] PageFault: a real #PF was triggered and demand-paged by the real handler, then resumed
+[page_fault] real #PF at 0x555555550000, demand-paged and resumed
+[PASS] Unmap: a real page unmap freed the real physical frame, and the address really re-faulted
 [syscall] real int 0x80 trap from ring 3, rax=10 — returning to ring 3
 [syscall] real int 0x80 trap from ring 3, rax=20 — returning to ring 3
 [syscall] real int 0x80 trap from ring 3, rax=30 — returning to ring 3
 [syscall] real int 0x80 EXIT trap from ring 3 — abandoning ring 3 for good
 [PASS] Syscall: real CPL3 code made 3 real round-trip syscalls + 1 real exit trap via int 0x80
 [PASS] Capability: real CapabilityBroker grants the issuer and denies a stranger
-[scheduler_bridge] real RunQueue + 2 real task contexts initialized
+[scheduler_bridge] real RunQueue + 3 real task contexts initialized (task_c will really exit)
 [PASS] SchedulerBoot: real RunQueue initialized
 [PASS] Sanctum: real vault created, entered, and region-isolated
 [PASS] SanctumBoot phase
 [PASS] Ipc: real capability-checked send/receive round-trip
-[PASS] IpcBoot phase
-[boot] BootSequencer ordering invariant holds: true
+[task_c] really exiting after 5 real iterations
 [task_a] real context switch resumed me, iteration 20
 [task_b] real context switch resumed me, iteration 20
 [task_a] real context switch resumed me, iteration 40
@@ -73,28 +74,33 @@ UOSC x86-64 — real boot starting
      hardware-timer-driven context switches, not a hardcoded print order —
      through iteration 200 each; note exactly *where* this interleaving
      falls in the log genuinely varies run to run — this specific run put
-     it between the BootSequencer line and SyscallBoot below, an earlier
-     run put it between SchedulerBoot and Sanctum — because the first
-     real switch away from kernel_main's own flow happens whenever a
-     timer tick first lands after scheduler_bridge::init(), which is real
-     interrupt timing, not a fixed point in the code)
+     it between the Ipc line and IpcBoot below, an earlier run put it
+     between SchedulerBoot and Sanctum — because the first real switch
+     away from kernel_main's own flow happens whenever a timer tick first
+     lands after scheduler_bridge::init(), which is real interrupt timing,
+     not a fixed point in the code)
+[PASS] IpcBoot phase
+[boot] BootSequencer ordering invariant holds: true
 [boot] SyscallBoot: a real int 0x80 entry point now exists (see the Syscall check above) — BootSequencer's SyscallBoot phase itself is still not completed, since there is no general syscall ABI or process model behind it yet
 [PASS] Scheduler: real context switches actually ran both kernel tasks, driven by the real hardware timer
+[PASS] TaskExit: a real dynamically spawned task ran, then really exited and left the real RunQueue
 
-=== UOSC boot self-test: 14/14 checks passed ===
+=== UOSC boot self-test: 16/16 checks passed ===
 ```
 
 QEMU's process exit code: `33`, which decodes (per `isa-debug-exit`'s
 `(value << 1) | 1` convention) to `ExitCode::Success = 0x10` — a real,
 scriptable pass signal, not a human reading a terminal. Reproduced across
-independent BIOS runs (both on QEMU's default CPU model, where `SMEP`/
-`SMAP` report unsupported and are correctly left off, and with
-`-cpu qemu64,+smep,+smap` forcing both on — see "Real NX/SMEP/SMAP"
-below) and an independent UEFI run (real EDK2 firmware, bundled with this
-environment's QEMU install — see "UEFI boot" below), byte-for-byte
-identical pass/fail shape each time, plus one clean rebuild from scratch
-(`rm -rf target`) re-verified on the exact commit-bound code to rule out
-stale-cache masking.
+**31 consecutive independent BIOS/UEFI runs** on the exact commit-bound,
+clean-rebuilt (`rm -rf target`) code: 15 on QEMU's default CPU model
+(where `SMEP`/`SMAP` report unsupported and are correctly left off), 5
+with `-cpu qemu64,+smep,+smap` forcing both on (see "Real NX/SMEP/SMAP"
+below), 1 independent UEFI run (real EDK2 firmware, bundled with this
+environment's QEMU install — see "UEFI boot" below), and a final batch of
+10 more on the clean-rebuilt binary — all byte-for-byte identical
+pass/fail shape. This many repeats weren't idle paranoia: see "Real task
+creation and exit" below for the real, ~1-in-4 intermittent failure this
+batch of runs actually caught and the fix that closed it.
 
 ## What actually happens at boot, and what code runs it
 
@@ -129,8 +135,9 @@ stale-cache masking.
    now allocating and freeing real physical pages, and now the same
    instance backing the heap and the page fault handler's demand paging
    too, not a disposable scratch copy.
-8. **A real page fault, deliberately triggered and demand-paged.** See
-   "Real hardware page tables" below.
+8. **A real page fault, deliberately triggered and demand-paged, then a
+   real unmap of that same page.** See "Real hardware page tables" and
+   "Real page unmapping" below.
 9. **A real ring-3 → ring-0 privilege transition.** See "Real ring-3
    syscall" below.
 10. **Real capability, sanctum, and IPC checks** — `uosc_core::capability`,
@@ -139,14 +146,16 @@ stale-cache masking.
    confirm inside-region access and outside-region denial; create a port,
    send and receive a capability-checked message) against real allocated
    state, not test fixtures.
-11. **Real hardware-timer-driven scheduling, with a real context switch.**
-   The PIT fires a real interrupt at 200 Hz; each one calls into
-   `scheduler_bridge.rs`, which runs the real
-   `uosc_core::scheduler::RunQueue::pick_next_task`/`update_vruntime` — the
-   exact code `Scheduler.lean`'s two-task proof and `SchedulerN.lean`'s
-   general n-task proof cover — and now, when that decision actually
-   changes which task should run, calls `context::switch_to` to really
-   switch the CPU to it. See "Real context switching" below for how.
+11. **Real hardware-timer-driven scheduling, with a real context switch,
+   real task creation, and real task exit.** The PIT fires a real
+   interrupt at 200 Hz; each one calls into `scheduler_bridge.rs`, which
+   runs the real `uosc_core::scheduler::RunQueue::pick_next_task`/
+   `update_vruntime` — the exact code `Scheduler.lean`'s two-task proof
+   and `SchedulerN.lean`'s general n-task proof cover — and now, when that
+   decision actually changes which task should run, calls
+   `context::switch_to` to really switch the CPU to it. Three tasks now
+   run this way, one of which (`task_c`) really exits partway through. See
+   "Real context switching" and "Real task creation and exit" below.
 12. **`uosc_core::boot::BootSequencer`** tracks real phase completion as
     each step above finishes, and `satisfies_ordering_invariant()` — the
     same function `Boot.lean` proves preserves Property 10 — is checked
@@ -217,6 +226,27 @@ bug in the already-"64 tests passing" `reference-rs` library itself,
 invisible until a real, tightly-bounded kernel heap finally made the
 difference between "wasteful" and "fails." Full writeup and fix in
 `../reference-rs/STATUS.md`.
+
+## Real page unmapping
+
+`paging::unmap_page` is new this pass — the real counterpart to
+`map_page`, not just an accounting fiction. It calls the real `Mapper::
+unmap` (a real page-table-entry removal plus a real TLB flush) and
+returns the real physical frame to the shared `PhysicalAllocator`, so
+it's genuinely available for the next `allocate()` again.
+
+**The self-test genuinely proves both halves, not just that the call
+returned `Ok`.** After the demand-paged fault above, it unmaps that exact
+page and checks the real physical allocator's free-page count went up by
+one — proof the frame really came back, not just that the page table
+entry changed. Then it writes through the *same pointer* a second time.
+Since the mapping is genuinely gone, this is a real, *second* `#PF` at the
+address that was already mapped once — the demand-page handler catches it
+again and maps a fresh page, and the self-test checks
+`PAGE_FAULTS_DEMAND_PAGED == 2`, not `1`. A no-op unmap (or one that
+silently failed) would have left the first mapping intact and this second
+write would never have faulted at all — so this really does distinguish
+"the page table entry is gone" from "the accounting says it's gone."
 
 ## Real ring-3 syscall
 
@@ -361,7 +391,7 @@ qemu-system-x86_64 \
 ```
 
 Real OVMF `BdsDxe` boot-manager output precedes the kernel's own, then the
-same self-test runs and passes: **14/14 checks, exit code 33.** Both boot
+same self-test runs and passes: **16/16 checks, exit code 33.** Both boot
 paths are now real, observed, passing runs, not one tested and one merely
 "should work."
 
@@ -404,6 +434,66 @@ having independently reached iteration 200 by the time the tick budget
 hands control back to the boot flow. No double fault, no triple fault, on
 any of 3 independent runs.
 
+## Real task creation and exit
+
+`scheduler_bridge::spawn_task`/`exit_current_task` are new this pass —
+real dynamic task creation and real task exit, not just the two
+statically-defined tasks from before. `spawn_task` installs a new task
+into any free slot of a fixed-size pool (`MAX_TASKS = 8` — a real,
+honestly-stated ceiling, the same kind as the kernel heap's fixed size):
+a real heap-allocated stack, the same real `context::init_stack` frame
+every task uses, and a real `RunQueue::add_process`. `exit_current_task`
+is the real counterpart — called by a task on itself, it really removes
+that task from the `RunQueue` (`pick_next_task` will never choose it
+again) and switches away for good, never resuming that stack. A new demo
+task, `task_c`, exercises this: it runs 5 real iterations (each resumed
+by a real context switch, exactly like `task_a`/`task_b`) and then really
+exits. The boot self-test's new `TaskExit` check confirms both halves —
+`task_c` actually ran *and* is genuinely gone from the live `RunQueue`
+afterward (`rq.get(pid).is_none()`), not just that an exit flag got set.
+
+**A real bug found and fixed empirically, not just by inspection** — and
+the actual reason the "31 consecutive runs" claim above needed to be that
+large a batch, not a token 3: the first version of `scheduler_bridge::
+init()` called `spawn_task` three times as three separate statements.
+Each individual call was already atomic (`spawn_task` disables interrupts
+for its own critical section), but interrupts were briefly live again
+*between* the three calls — and by the time `SchedulerBoot` runs,
+interrupts are already globally enabled (`LateBoot` turns them on first,
+earlier in boot). A timer tick landing in one of those gaps could preempt
+`init()` itself — an already-queued earlier task (`task_a`, say) is a
+perfectly legitimate switch target — suspending `init()` mid-spawn. Since
+`on_timer_tick` permanently pins the CPU to `BOOT_PID` once the
+`SWITCH_TICK_BUDGET` tick budget is spent (every later tick sees
+`prev == next == BOOT_PID` and returns immediately), an `init()` resumed
+*after* that threshold would finish spawning whatever tasks were left,
+but they would then never actually get scheduled — the boot flow now
+monopolizes the CPU for good.
+
+This wasn't a theoretical concern: a 15-run batch on the version with
+three separate `spawn_task` calls failed **twice** (a real ~13% observed
+rate) — once with only `TaskExit` failing (`task_c` never got spawned in
+time to run and exit), once with *both* `TaskExit` and `Scheduler` failing
+(the delay was long enough that `task_a`/`task_b` themselves didn't get
+enough runway either). Both are real, reproducible self-test failures
+from real, reproducible boot output — not a hypothetical race flagged by
+code review. Fixed by wrapping the whole of `init()` — all three
+`spawn_task` calls together — in one `without_interrupts` critical
+section instead of three separate ones (safe to nest: `spawn_task`'s own
+internal `without_interrupts` call is a no-op once interrupts are already
+disabled). Reconfirmed clean across 31 further consecutive runs after the
+fix (see "What's real right now" above) — zero failures, versus roughly 2
+in 15 before.
+
+**Scope, stated plainly**: the task pool is fixed-size, not unbounded. An
+exited task's stack is deliberately **not freed** — a real, documented
+leak, not silently ignored. Freeing it safely would require proving
+nothing can still be executing on it at the moment of the free (true for
+a task that switches *itself* away, since it never touches its own stack
+again after `switch_to` — but that's real, additional bookkeeping this
+pass didn't attempt). No task hierarchy (parent/child, wait/reap), no
+blocking/IO-driven rescheduling, no SMP.
+
 ## The GDT/segment-register bug (from the context-switching pass)
 
 Setting up a brand-new GDT and switching `CS` to it is not enough on
@@ -424,27 +514,31 @@ hardware.
 
 ## What this deliberately does not claim
 
-- **The context switch is real but narrow.** Exactly two statically
-  defined kernel tasks exist; there is no task creation, no task exit, no
-  blocking/IO-driven rescheduling (a task can only ever yield by being
-  timer-preempted), and no SMP (the switch code's soundness argument in
-  `context.rs`/`scheduler_bridge.rs` explicitly leans on "single core,
-  only ever touched with interrupts disabled" — a second CPU would break
-  that invariant and needs real synchronization, not attempted here).
-  Handing control back to the boot flow after a fixed tick budget is a
-  hardcoded sentinel (`BOOT_PID`), not the scheduler genuinely managing
-  the kernel's own boot thread as a task.
+- **The context switch and task model are real but narrow.** Real task
+  creation and real task exit now exist (see "Real task creation and
+  exit" above), but only within a fixed-size pool (`MAX_TASKS = 8`); an
+  exited task's stack is never freed; there is still no blocking/IO-driven
+  rescheduling (a task can only ever yield by being timer-preempted), no
+  task hierarchy (parent/child, wait/reap), and no SMP (the switch code's
+  soundness argument in `context.rs`/`scheduler_bridge.rs` explicitly
+  leans on "single core, only ever touched with interrupts disabled" — a
+  second CPU would break that invariant and needs real synchronization,
+  not attempted here). Handing control back to the boot flow after a
+  fixed tick budget is a hardcoded sentinel (`BOOT_PID`), not the
+  scheduler genuinely managing the kernel's own boot thread as a task.
 - **The page tables are real but narrow.** There's exactly one address
   space — everything (kernel code, heap, demand-paged region) lives in the
   single CR3 this kernel's own `OffsetPageTable` manages; there is no
-  second, isolated address space, no process/kernel privilege separation
-  (everything still runs at CPL0), and no unmapping/freeing path for
-  pages once mapped (`paging::map_page`'s counterpart `unmap` doesn't
-  exist yet). The physical allocator is still a single contiguous arena
-  (the largest usable region reported by the bootloader, minus the
-  handful of frames the paging bootstrap consumed) — a real multi-region
-  allocator is still real, separate follow-on work, unchanged from
-  `reference-rs/STATUS.md`'s original note.
+  second, isolated address space and no process/kernel privilege
+  separation (everything still runs at CPL0). Real unmapping now exists
+  (`paging::unmap_page`, see "Real page unmapping" above), but nothing in
+  this kernel calls it except the self-test's own deliberate demonstration
+  — there's no general "free this VMA" path wired into anything else yet.
+  The physical allocator is still a single contiguous arena (the largest
+  usable region reported by the bootloader, minus the handful of frames
+  the paging bootstrap consumed) — a real multi-region allocator is still
+  real, separate follow-on work, unchanged from `reference-rs/STATUS.md`'s
+  original note.
 - **The kernel heap is fixed-size** (256 KiB bootstrap + 1 MiB real =
   1.25 MiB total, `allocator.rs`'s `BOOTSTRAP_HEAP_SIZE`/`REAL_HEAP_SIZE`)
   — real, page-mapped memory, but a hardcoded ceiling, not something that
