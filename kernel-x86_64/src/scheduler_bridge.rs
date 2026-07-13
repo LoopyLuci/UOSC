@@ -74,6 +74,26 @@
 //! available to confirm that historically, and none is available now
 //! either.
 //!
+//! **Real task-to-address-space binding, new this pass.** Until now,
+//! `address_space.rs`'s second, independent `CR3`-loadable table was a
+//! manual, one-shot demonstration — `main.rs`'s self-test switched to it,
+//! read it, and switched straight back, entirely separate from real task
+//! scheduling. This pass ties the two together for real:
+//! [`spawn_task_with_address_space`] binds a task to a specific L4 frame
+//! at spawn time (stored in that task's `TaskSlot::address_space`), and
+//! [`switch_address_space_to`] — called from *both* real switch call
+//! sites, [`on_timer_tick`] and [`exit_current_task`], right before the
+//! real [`context::switch_to`] — performs a real `CR3` write whenever the
+//! task being switched *into* needs a different table than what's
+//! currently active. A tick switching between two ordinary kernel tasks
+//! (the overwhelmingly common case) costs nothing beyond a `CR3` read that
+//! finds nothing to change; a tick switching into `task_e` — spawned by
+//! [`init`] bound to its own fresh `AddressSpace` — performs a real
+//! switch, and `task_e` proves it by reading straight through
+//! `address_space::PRIVATE_REGION_ADDR` every iteration: that only
+//! resolves correctly if the *ordinary, timer-driven* scheduler really
+//! did switch `CR3`, not a special path task_e itself invokes.
+//!
 //! **Scope, stated plainly**: the task pool is fixed-size
 //! (`MAX_TASKS`), not unbounded — the same honestly-stated ceiling as the
 //! kernel heap's fixed size. After a fixed tick budget, control is handed
@@ -84,11 +104,18 @@
 //! not a real scheduled entity — `BOOT_PID` is never added to the
 //! `RunQueue`. Still not a general-purpose scheduler: no blocking/IO-
 //! driven rescheduling, no SMP, no task hierarchy (parent/child, wait/
-//! reap), no priorities beyond what `PriorityClass` already offers.
+//! reap), no priorities beyond what `PriorityClass` already offers. Task-
+//! to-address-space binding is likewise real but narrow: one-way only (a
+//! task is bound at spawn time and never rebinds), no unbind/teardown
+//! path (a bound task's `AddressSpace` is never freed even if the task
+//! later exited — no task that owns one does exit in this pass anyway),
+//! and no process abstraction wraps the pairing (a `TaskSlot` just holds
+//! an `Option<PhysFrame>`, not a first-class "process" concept).
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 use uosc_core::scheduler::{PriorityClass, Process, ProcessState, RunQueue};
+use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
 use crate::context::{self, Context};
 use crate::serial_println;
@@ -115,13 +142,29 @@ const SWITCH_TICK_BUDGET: u64 = 400;
 static TASK_EXIT_SLOT: Mutex<Option<usize>> = Mutex::new(None);
 static TASK_D_SPAWN_SLOT: Mutex<Option<usize>> = Mutex::new(None);
 
+/// The real L4 frame every task *without* its own bound address space
+/// runs in — captured once, in [`init`], from whatever `CR3` actually is
+/// at that point (by then, `main.rs`'s own `AddressSpace` self-test has
+/// already switched to its demo table and switched back — see
+/// `address_space.rs` — so this really is the original/default table, not
+/// a leftover from that demo). Used by [`desired_l4_frame`] as the
+/// fallback for `BOOT_PID` and for any task whose own `TaskSlot::
+/// address_space` is `None`.
+static DEFAULT_L4_FRAME: Mutex<Option<PhysFrame<Size4KiB>>> = Mutex::new(None);
+
 struct TaskSlot {
     pid: Option<u64>,
     context: Context,
+    /// `Some(frame)` if this task is really bound to its own,
+    /// independent address space (see [`spawn_task_with_address_space`]);
+    /// `None` means "runs in [`DEFAULT_L4_FRAME`], like every task before
+    /// this pass." See module docs' "Real task-to-address-space binding"
+    /// section.
+    address_space: Option<PhysFrame<Size4KiB>>,
 }
 
 impl TaskSlot {
-    const EMPTY: TaskSlot = TaskSlot { pid: None, context: Context::EMPTY };
+    const EMPTY: TaskSlot = TaskSlot { pid: None, context: Context::EMPTY, address_space: None };
 }
 
 /// Only ever touched with interrupts disabled — either from inside the
@@ -138,6 +181,7 @@ static COUNTER_A: AtomicU64 = AtomicU64::new(0);
 static COUNTER_B: AtomicU64 = AtomicU64::new(0);
 static COUNTER_C: AtomicU64 = AtomicU64::new(0);
 static COUNTER_D: AtomicU64 = AtomicU64::new(0);
+static COUNTER_E: AtomicU64 = AtomicU64::new(0);
 static TASK_C_EXITED: AtomicBool = AtomicBool::new(false);
 static TASK_D_SPAWNED: AtomicBool = AtomicBool::new(false);
 static TASK_C_PID: Mutex<Option<u64>> = Mutex::new(None);
@@ -218,6 +262,30 @@ extern "C" fn task_d_entry() -> ! {
     }
 }
 
+/// Bound, at spawn time, to its own real, independent address space (see
+/// [`spawn_task_with_address_space`] and module docs) — every iteration
+/// reads straight through the real virtual address
+/// `crate::address_space::PRIVATE_REGION_ADDR`, with **no physical-offset
+/// back door**. That read only resolves to the expected value at all
+/// because a real `CR3` write (performed by [`switch_address_space_to`]
+/// as an ordinary part of the timer-driven scheduling decision that
+/// switches into this task, not a manual one-shot) actually happened —
+/// if the binding were wrong, this would either read the wrong value or,
+/// if the private page isn't mapped in whatever table is actually active,
+/// genuinely page-fault (a loud, diagnosable failure, not a silent one).
+extern "C" fn task_e_entry() -> ! {
+    loop {
+        let value = unsafe { (crate::address_space::PRIVATE_REGION_ADDR as *const u64).read_volatile() };
+        if value == crate::address_space::PRIVATE_VALUE {
+            let n = COUNTER_E.fetch_add(1, Ordering::SeqCst) + 1;
+            if n.is_multiple_of(20) {
+                serial_println!("[task_e] real context switch into my own real, bound address space resumed me, iteration {n}");
+            }
+        }
+        x86_64::instructions::hlt();
+    }
+}
+
 fn context_ptr(pid: u64) -> *mut u64 {
     if pid == BOOT_PID {
         return unsafe { &raw mut BOOT_CONTEXT.rsp };
@@ -253,10 +321,28 @@ fn slot_index_for_pid(pid: u64) -> Option<usize> {
 }
 
 /// Installs `entry` as a new, really scheduled task in any free slot of
-/// the fixed-size pool: a real guard-page-protected stack (see
-/// `task_stack.rs`), a real [`context::init_stack`] frame, and a real
-/// `RunQueue::add_process`. Returns `None` if all `MAX_TASKS` real slots
-/// are already in use.
+/// the fixed-size pool, running in [`DEFAULT_L4_FRAME`] like every task
+/// before this pass. See [`spawn_task_with_address_space`] for the real
+/// per-task address-space binding, and [`spawn_task_impl`] for the shared
+/// mechanics both go through.
+pub fn spawn_task(entry: extern "C" fn() -> !) -> Option<u64> {
+    spawn_task_impl(entry, None)
+}
+
+/// Installs `entry` as a new, really scheduled task, real bound to
+/// `l4_frame` — a real, independent address space (typically
+/// `AddressSpace::l4_frame()`) this task, and only this task, will really
+/// run in. See module docs' "Real task-to-address-space binding" section
+/// for the full mechanism and [`task_e_entry`] for the demo that exercises
+/// it.
+pub fn spawn_task_with_address_space(entry: extern "C" fn() -> !, l4_frame: PhysFrame<Size4KiB>) -> Option<u64> {
+    spawn_task_impl(entry, Some(l4_frame))
+}
+
+/// Shared mechanics for [`spawn_task`]/[`spawn_task_with_address_space`]:
+/// a real guard-page-protected stack (see `task_stack.rs`), a real
+/// [`context::init_stack`] frame, and a real `RunQueue::add_process`.
+/// Returns `None` if all `MAX_TASKS` real slots are already in use.
 ///
 /// Disables interrupts for its critical section — `TASK_SLOTS` is a plain
 /// `static mut`, and a timer tick landing mid-mutation (this can run with
@@ -272,7 +358,7 @@ fn slot_index_for_pid(pid: u64) -> Option<usize> {
 /// `static mut` access itself is still fully guarded), but a real,
 /// needless multi-hundred-tick stall waiting for the tick budget to hand
 /// control back, caught by inspection rather than by observing it happen.
-pub fn spawn_task(entry: extern "C" fn() -> !) -> Option<u64> {
+fn spawn_task_impl(entry: extern "C" fn() -> !, address_space: Option<PhysFrame<Size4KiB>>) -> Option<u64> {
     let pid = NEXT_PID.fetch_add(1, Ordering::SeqCst);
 
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -281,7 +367,12 @@ pub fn spawn_task(entry: extern "C" fn() -> !) -> Option<u64> {
 
         // Real, guard-page-protected pages for this slot — mapped the
         // first time this index is ever used, reused thereafter. See
-        // task_stack.rs.
+        // task_stack.rs. Note: these pages live in DEFAULT_L4_FRAME (the
+        // shared clone-source every AddressSpace::new() copies from), so
+        // even a task bound to its own address space still finds its own
+        // stack mapped identically there — the same sharing argument
+        // address_space.rs's module docs already make for kernel code
+        // and the heap.
         let stack_top = task_stack::ensure_slot_mapped(free_index);
         let stack_base = stack_top - task_stack::STACK_SIZE;
 
@@ -298,12 +389,55 @@ pub fn spawn_task(entry: extern "C" fn() -> !) -> Option<u64> {
         unsafe {
             (*slots)[free_index].pid = Some(pid);
             (*slots)[free_index].context = ctx;
+            (*slots)[free_index].address_space = address_space;
         }
         if let Some(rq) = SCHEDULER.lock().as_mut() {
             rq.add_process(Process { pid, class: PriorityClass::Normal, state: ProcessState::Ready, vruntime: 0 });
         }
         Some(pid)
     })
+}
+
+/// The real L4 frame `pid` should be running in — `DEFAULT_L4_FRAME` for
+/// `BOOT_PID`, for any task with no bound address space, or if
+/// `DEFAULT_L4_FRAME` itself hasn't been captured yet (defensive; `init`
+/// always captures it before any task can run).
+fn desired_l4_frame(pid: u64) -> Option<PhysFrame<Size4KiB>> {
+    let default = *DEFAULT_L4_FRAME.lock();
+    if pid == BOOT_PID {
+        return default;
+    }
+    unsafe {
+        let slots: *const [TaskSlot; MAX_TASKS] = &raw const TASK_SLOTS;
+        (*slots).iter().find(|s| s.pid == Some(pid)).and_then(|s| s.address_space).or(default)
+    }
+}
+
+/// Real task-to-address-space binding, in one line: a real `CR3` read to
+/// see what's actually active, compared against what `pid` should be
+/// running in, and a real `CR3` write only if they differ — so switching
+/// between two tasks that share the same (default) address space, the
+/// overwhelmingly common case, costs nothing beyond the read. Called
+/// right before every real [`context::switch_to`], from both
+/// [`on_timer_tick`] and [`exit_current_task`], so this is genuinely part
+/// of the ordinary scheduling path, not a separate mechanism a task has to
+/// opt into.
+///
+/// Safe to call with interrupts disabled from inside the timer ISR (the
+/// only two call sites) because every real `AddressSpace` this kernel
+/// creates (`address_space.rs::AddressSpace::new`) clones every entry
+/// from the table active at its own creation time — so the kernel code,
+/// IDT/GDT, and every task's own guarded stack resolve identically no
+/// matter which of these tables is active when the switch actually
+/// happens.
+fn switch_address_space_to(pid: u64) {
+    let Some(desired) = desired_l4_frame(pid) else { return };
+    let (current, flags) = x86_64::registers::control::Cr3::read();
+    if current != desired {
+        unsafe {
+            x86_64::registers::control::Cr3::write(desired, flags);
+        }
+    }
 }
 
 /// Called by a task on itself to really exit: removes it from the real
@@ -333,6 +467,8 @@ pub fn exit_current_task() -> ! {
         SCHEDULER.lock().as_ref().and_then(|rq| rq.pick_next_task()).unwrap_or(BOOT_PID)
     };
     *CURRENT.lock() = next;
+
+    switch_address_space_to(next);
 
     let next_rsp = context_rsp(next);
     // A throwaway save slot: nothing will ever switch back into this
@@ -373,13 +509,28 @@ pub fn exit_current_task() -> ! {
 pub fn init() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         *SCHEDULER.lock() = Some(RunQueue::new());
+        // Real CR3 at this exact point is the true default/boot table —
+        // main.rs's own AddressSpace self-test (which runs earlier) has
+        // already switched to its demo table and switched back. See
+        // DEFAULT_L4_FRAME's docs.
+        *DEFAULT_L4_FRAME.lock() = Some(x86_64::registers::control::Cr3::read().0);
 
         spawn_task(task_a_entry);
         spawn_task(task_b_entry);
         let c = spawn_task(task_c_entry);
         *TASK_C_PID.lock() = c;
 
-        serial_println!("[scheduler_bridge] real RunQueue + 3 real task contexts initialized (task_c will really exit)");
+        // task_e: real task-to-address-space binding. Builds one more
+        // real AddressSpace (a full clone of the table active right now,
+        // plus its own private page — see address_space.rs) and binds
+        // task_e to it — the ordinary timer-driven scheduler, not a
+        // manual one-shot, is what actually switches CR3 into and out of
+        // it from here on.
+        if let Some(space) = crate::address_space::AddressSpace::new() {
+            spawn_task_with_address_space(task_e_entry, space.l4_frame());
+        }
+
+        serial_println!("[scheduler_bridge] real RunQueue + 4 real task contexts initialized (task_c will really exit, task_e is bound to its own real address space)");
     });
 }
 
@@ -418,6 +569,7 @@ pub fn on_timer_tick() {
     // Every lock above is dropped before this point — required, since
     // switch_to may not return here until this exact context is resumed,
     // which could be many ticks (and many other lock acquisitions) later.
+    switch_address_space_to(next);
     let prev_ptr = context_ptr(prev);
     let next_rsp = context_rsp(next);
     unsafe {
@@ -453,4 +605,14 @@ pub fn task_c_really_exited() -> bool {
 pub fn task_reused_a_guarded_slot() -> bool {
     let exit_slot = *TASK_EXIT_SLOT.lock();
     COUNTER_D.load(Ordering::SeqCst) > 0 && exit_slot.is_some() && exit_slot == *TASK_D_SPAWN_SLOT.lock()
+}
+
+/// Read back for the boot self-test: did `task_e` — bound, at spawn time,
+/// to its own real, independent address space — really run *and* really
+/// see its private mapping resolve correctly every single time (not just
+/// once), proof the ordinary timer-driven scheduler is genuinely
+/// switching `CR3` as part of scheduling `task_e` in and out, not merely
+/// running it in whatever table happened to already be active.
+pub fn task_e_verified_own_address_space() -> bool {
+    COUNTER_E.load(Ordering::SeqCst) > 0
 }

@@ -136,6 +136,15 @@ impl AddressSpace {
         Some(AddressSpace { l4_frame: new_l4_frame })
     }
 
+    /// The real physical frame backing this address space's L4 table —
+    /// what a real `CR3` write to it actually loads. Exposed so callers
+    /// that manage their own switching (`scheduler_bridge.rs`'s
+    /// task-to-address-space binding, rather than this module's own
+    /// [`switch_to`]/[`restore`] pair) can store and compare it directly.
+    pub fn l4_frame(&self) -> PhysFrame<Size4KiB> {
+        self.l4_frame
+    }
+
     /// A real `CR3` write to this address space's L4 frame — the CPU's
     /// page walker genuinely starts resolving every subsequent memory
     /// access through this table from this instruction onward. Returns

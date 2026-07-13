@@ -44,7 +44,7 @@ qemu-system-x86_64 -drive format=raw,file=uosc-bios.img \
 ```
 UOSC x86-64 — real boot starting
 [cpu] NX=true (EFER.NXE) SMEP=false SMAP=false (CR4), each gated on a real CPUID check
-[memory] real usable region 0x1471000..0x7fe0000, using 27503 pages for the real PhysicalAllocator
+[memory] real usable region 0x1472000..0x7fe0000, using 27502 pages for the real PhysicalAllocator
 [PASS] CpuSecurity: real EFER.NXE/CR4.SMEP/CR4.SMAP match what CPUID said was supported
 [PASS] EarlyBoot: GDT + IDT installed
 [PASS] LateBoot: PIC/PIT/interrupts enabled
@@ -55,52 +55,55 @@ UOSC x86-64 — real boot starting
 [page_fault] real #PF at 0x555555550000, demand-paged and resumed
 [PASS] Unmap: a real page unmap freed the real physical frame, and the address really re-faulted
 [PASS] AddressSpace: a real second CR3-loadable page table, verified absent-then-present-then-restored
-[syscall] real int 0x80 trap from ring 3, rax=10 — returning to ring 3
-[syscall] real int 0x80 trap from ring 3, rax=20 — returning to ring 3
-[syscall] real int 0x80 trap from ring 3, rax=30 — returning to ring 3
+[syscall] real int 0x80 trap from ring 3: number=1 arg0=7 arg1=8 -> 15
+[syscall] real int 0x80 trap from ring 3: number=2 arg0=1234 arg1=1099511753624 -> 1234
+[syscall] real int 0x80 trap from ring 3: number=3 arg0=1249 arg1=1099511753624 -> 0
 [syscall] real int 0x80 EXIT trap from ring 3 — abandoning ring 3 for good
-[PASS] Syscall: real CPL3 code made 3 real round-trip syscalls + 1 real exit trap via int 0x80
+[PASS] Syscall: real CPL3 code made 2 real multi-argument syscalls + reported their real, ring-3-computed sum
 [PASS] Capability: real CapabilityBroker grants the issuer and denies a stranger
 [task_stack] slot 0: mapped a real 64 KiB guarded stack at 0x333333331000, real unmapped guard page at 0x333333330000
 [task_stack] slot 1: mapped a real 64 KiB guarded stack at 0x333333342000, real unmapped guard page at 0x333333341000
 [task_stack] slot 2: mapped a real 64 KiB guarded stack at 0x333333353000, real unmapped guard page at 0x333333352000
-[scheduler_bridge] real RunQueue + 3 real task contexts initialized (task_c will really exit)
-[PASS] SchedulerBoot: real RunQueue initialized
-[PASS] Sanctum: real vault created, entered, and region-isolated
-[PASS] SanctumBoot phase
+[task_stack] slot 3: mapped a real 64 KiB guarded stack at 0x333333364000, real unmapped guard page at 0x333333363000
+[scheduler_bridge] real RunQueue + 4 real task contexts initialized (task_c will really exit, task_e is bound to its own real address space)
 [task_c] really exiting after 5 real iterations
 [task_d] really spawned at runtime, first real context switch resumed me
 [task_a] real context switch resumed me, iteration 20
 [task_b] real context switch resumed me, iteration 20
-[task_a] real context switch resumed me, iteration 40
+[task_e] real context switch into my own real, bound address space resumed me, iteration 20
 [task_b] real context switch resumed me, iteration 40
-... (task_a/task_b keep alternating — real interleaving from real,
+[task_e] real context switch into my own real, bound address space resumed me, iteration 40
+[task_a] real context switch resumed me, iteration 40
+... (task_a/task_b/task_e keep alternating — real interleaving from real,
      hardware-timer-driven context switches, not a hardcoded print order —
-     through iteration 200 each; note exactly *where* this interleaving,
-     and where the SchedulerBoot/Sanctum/Ipc PASS lines below land
-     relative to it, genuinely varies run to run — this specific run put
-     Sanctum's PASS lines *before* task_a/task_b's activity and Ipc's
-     *after*; a different run has put all of them before, or all after —
-     because the first real switch away from kernel_main's own flow
-     happens whenever a timer tick first lands after
-     scheduler_bridge::init(), which is real interrupt timing, not a
-     fixed point in the code)
+     through iteration 200 each for task_a/task_b; note exactly *where*
+     this interleaving, and where the SchedulerBoot/Sanctum/Ipc PASS lines
+     below land relative to it, genuinely varies run to run — this
+     specific run put all of them after this activity, a different run
+     has interspersed them — because the first real switch away from
+     kernel_main's own flow happens whenever a timer tick first lands
+     after scheduler_bridge::init(), which is real interrupt timing, not
+     a fixed point in the code)
+[PASS] SchedulerBoot: real RunQueue initialized
+[PASS] Sanctum: real vault created, entered, and region-isolated
+[PASS] SanctumBoot phase
 [PASS] Ipc: real capability-checked send/receive round-trip
 [PASS] IpcBoot phase
 [boot] BootSequencer ordering invariant holds: true
-[boot] SyscallBoot: a real int 0x80 entry point now exists (see the Syscall check above) — BootSequencer's SyscallBoot phase itself is still not completed, since there is no general syscall ABI or process model behind it yet
+[boot] SyscallBoot: a real int 0x80 entry point and a real, small number->handler syscall dispatch table now exist (see the Syscall check above) — BootSequencer's SyscallBoot phase itself is still not completed, since there is no process model or dynamically extensible syscall registry behind it yet, only a fixed, compile-time table
 [PASS] Scheduler: real context switches actually ran both kernel tasks, driven by the real hardware timer
 [PASS] TaskExit: a real dynamically spawned task ran, then really exited and left the real RunQueue
 [PASS] TaskReuse: a task spawned live at runtime ran, really reusing the exact same guard-page-protected stack slot an exited task used
+[PASS] TaskAddressSpace: a real scheduled task ran with the ordinary timer-driven scheduler really switching CR3 to its own bound address space
 
-=== UOSC boot self-test: 18/18 checks passed ===
+=== UOSC boot self-test: 19/19 checks passed ===
 ```
 
 QEMU's process exit code: `33`, which decodes (per `isa-debug-exit`'s
 `(value << 1) | 1` convention) to `ExitCode::Success = 0x10` — a real,
 scriptable pass signal, not a human reading a terminal.
 
-**Reproduced across well over 250 independent BIOS/UEFI runs total across
+**Reproduced across well over 300 independent BIOS/UEFI runs total across
 this crate's history**, most recently: 31 consecutive runs verifying NX/
 SMEP/SMAP, then a batch verifying page unmapping + task creation/exit
 that caught two real, separate, fixed intermittent bugs, then 66 further
@@ -110,14 +113,18 @@ then a guard-page-protected-stack rewrite, which itself caught a real,
 address — see "Real guard-page-protected task stacks" below) and, once
 fixed, 51 further consecutive runs, then a one-time manual SMEP
 fault-and-recover verification (see "Real NX/SMEP/SMAP" above) plus 8
-further consecutive runs confirming the revert, then this pass's second,
-genuinely independent address space (see "Real multiple address spaces"
-below), which passed **on its first boot** and, since then, **50 further
-consecutive runs with zero failures** (25 on QEMU's default CPU model, 10
-with `-cpu qemu64,+smep,+smap` forcing both on, 1 independent UEFI run,
-15 more on a from-scratch clean rebuild). This many repeats weren't idle
-paranoia — real bugs were caught and fixed exactly because of this volume
-of testing at every stage; see "Real task creation and exit" and "Real
+further consecutive runs confirming the revert, then a second, genuinely
+independent address space (see "Real multiple address spaces" below),
+which passed on its first boot and 50 further consecutive runs, then this
+pass's real syscall ABI generalization and real task-to-address-space
+binding (see "Real, small syscall ABI" and "Real task-to-address-space
+binding" below), both of which also passed **on their first boot** — no
+bug found this time in either — and, since then, **51 further consecutive
+runs with zero failures** (25 on QEMU's default CPU model, 10 with `-cpu
+qemu64,+smep,+smap` forcing both on, 1 independent UEFI run, 15 more on a
+from-scratch clean rebuild). This many repeats weren't idle paranoia —
+real bugs were caught and fixed exactly because of this volume of testing
+at every stage; see "Real task creation and exit" and "Real
 guard-page-protected task stacks" below for the full list, including one
 older finding that remains honestly documented as *mitigated, not
 debugger-confirmed root-caused* even after a later pass's stronger,
@@ -341,14 +348,14 @@ non-default address space automatically. A real second CR3 that a task
 could be scheduled into, with its own private memory a *different* task
 genuinely cannot see or corrupt, is real, separate, follow-on work.
 
-## Real ring-3 syscall
+## Real, small syscall ABI
 
-`syscall.rs` is new this pass: a real ring-3 (CPL3) → ring-0 privilege
-transition, not CPL0 code merely pretending to be "userspace." A real
-hand-assembled program runs at CPL3 on real hardware, makes **three real
-round-trip syscalls plus one real exit syscall**, and the real handler
-observes each value in order. Full mechanism in `syscall.rs`'s module
-docs; short version:
+`syscall.rs`: a real ring-3 (CPL3) → ring-0 privilege transition, not
+CPL0 code merely pretending to be "userspace." A real hand-assembled
+program runs at CPL3 on real hardware, makes **two real, multi-argument
+syscalls plus one real exit syscall**, and a real dispatch table — not
+one hardcoded comparison — routes each by number to its own handler.
+Full mechanism in `syscall.rs`'s module docs; short version:
 
 - `enter_ring3` (naked `asm!`) saves the kernel's stack pointer and
   callee-saved registers — the same convention as
@@ -359,27 +366,59 @@ docs; short version:
   function's address — its exact length has to be known with certainty
   when copying it into a freshly mapped, real, user-accessible page, and
   hand-assembling avoids any risk of position-dependent relocations
-  breaking when the bytes move to a new address. It makes four real
-  traps in sequence: `mov eax,10/20/30; int 0x80` three times, then
-  `mov eax,999; int 0x80` (the exit syscall).
+  breaking when the bytes move to a new address. It calls
+  `SYS_ADD(7, 8)` (real two-argument syscall, returns `15`), folds that
+  into `SYS_ECHO(1234)`'s return value (`1249`), reports that
+  ring-3-computed sum via `SYS_REPORT`, then makes the exit trap.
 - `int 0x80` traps into `syscall_entry_stub`, installed by raw address
   (`Entry::set_handler_addr`, not the typed `extern "x86-interrupt"`
-  convention, since reading `rax` at the trap needs the real register
-  file) with DPL set to `Ring3` so a real `int 0x80` from CPL3 doesn't
-  raise a real `#GP` first.
-- **Two genuinely different real returns**, not one: for the three
-  ordinary syscalls, the stub does the textbook thing — record the
-  value, then `iretq` using the *same* hardware-pushed interrupt frame
-  the trap already left on the stack, resuming ring 3 at the very next
-  instruction after `int 0x80`. Nothing is reconstructed; that's what
-  `iretq` is for. Only the exit syscall abandons ring 3 — exactly like
+  convention, since reading the real register file at the trap needs
+  exactly that) with DPL set to `Ring3` so a real `int 0x80` from CPL3
+  doesn't raise a real `#GP` first.
+- **A real register shuffle, not just a rename.** Ring-3 code places the
+  syscall number in `rax` and up to three arguments in `rdi`/`rsi`/`rdx`
+  — this kernel's own convention. To call `dispatch_syscall` (an ordinary
+  `extern "C"` function expecting its four `u64` arguments in
+  `rdi`/`rsi`/`rdx`/`rcx` per System V) the stub moves `rcx←rdx←rsi←rdi←
+  rax` in that exact dependency order, so each register is read before
+  it's overwritten. The call's real return value lands in `rax`
+  automatically, and nothing overwrites it again before `iretq` — ring 3
+  resumes with exactly that value, with no separate "write the result
+  back" step needed.
+- **A real number→handler dispatch table** (`dispatch_syscall`, matching
+  on `number` to select a real function pointer among `sys_add`/
+  `sys_echo`/`sys_report`/`sys_exit`), not the single `cmp eax, 999`
+  branch the original one-shot version used. Genuinely narrow still — a
+  small, compile-time-fixed table, not a dynamically extensible registry
+  — but a real dispatch mechanism, not a special case.
+- **Two genuinely different real returns**, not one: for ordinary
+  syscalls, the stub calls `dispatch_syscall` then `iretq`s using the
+  *same* hardware-pushed interrupt frame the trap already left on the
+  stack, resuming ring 3 at the very next instruction after `int 0x80`.
+  Only the exit syscall abandons ring 3 — exactly like
   `scheduler_bridge.rs`'s `BOOT_PID` handback, loading the kernel stack
   pointer `enter_ring3` saved and `ret`ing straight back into
   `run_demo_syscall`'s caller.
-- The branch between those two paths happens *before* calling into Rust,
-  comparing the trapped `rax` directly — `record_syscall` is a normal
-  `extern "C"` function, free to clobber `rax` as scratch, so relying on
-  it surviving the call would have been a real bug waiting to happen.
+
+**Verified by a value only a genuinely correct round trip could
+produce.** The old version's self-test observed three fixed constants
+(10/20/30) arrive in order — real proof ring 3 resumed and retrapped
+correctly, but no proof arguments or return values worked at all (the
+old ABI only ever carried a syscall *number*, nothing else). This
+pass's check instead asserts the exact reported value `1249`: `SYS_ADD
+(7, 8)` must have really received both arguments and really returned
+`15`, and `SYS_ECHO(1234)` must have really returned `1234`, and the
+*ring-3 program itself* must have correctly summed them — a single wrong
+register in the shuffle, or a return value silently dropped, would
+change this number, not just fail to print an unrelated flag.
+
+Boot log, this pass, verbatim (see the full boot log above for context):
+```
+[syscall] real int 0x80 trap from ring 3: number=1 arg0=7 arg1=8 -> 15
+[syscall] real int 0x80 trap from ring 3: number=2 arg0=1234 arg1=... -> 1234
+[syscall] real int 0x80 trap from ring 3: number=3 arg0=1249 arg1=... -> 0
+[syscall] real int 0x80 EXIT trap from ring 3 — abandoning ring 3 for good
+```
 
 **Two real bugs found building the original one-shot version**, on top of
 the `seed_free_lists` bug above, plus one near-miss avoided while
@@ -746,6 +785,67 @@ and none is available now either; that specific historical question
 remains open. What's real is that the failure mode the hypothesis pointed
 at is now architecturally closed off, not merely made statistically rare.
 
+## Real task-to-address-space binding
+
+Until this pass, `address_space.rs`'s second, independent `CR3`-loadable
+table (see "Real multiple address spaces" above) was a manual, one-shot
+demonstration — `main.rs`'s self-test switched to it, read it, and
+switched straight back, entirely separate from real task scheduling.
+This pass ties the two together for real, in `scheduler_bridge.rs`:
+
+- **`TaskSlot` now carries `address_space: Option<PhysFrame<Size4KiB>>`**
+  — `None` (every task before this pass, and `task_a`/`b`/`c`/`d` still)
+  means "run in `DEFAULT_L4_FRAME`," the real L4 frame captured once, in
+  `init()`, from whatever `CR3` actually is at that point (by then,
+  `main.rs`'s own `AddressSpace` check has already switched to its demo
+  table and switched back, so this really is the original/default
+  table).
+- **`spawn_task_with_address_space`** binds a task to a specific L4 frame
+  at spawn time — `init()` uses it for a new demo task, `task_e`, bound
+  to a fresh `AddressSpace::new()` built the same way the earlier,
+  manual demo built its own.
+- **`switch_address_space_to`** — a real `CR3` read compared against the
+  frame the task being switched *into* should run in, with a real `CR3`
+  write only when they differ — is called from *both* real switch call
+  sites, `on_timer_tick` and `exit_current_task`, right before the real
+  `context::switch_to`. This is genuinely part of the ordinary scheduling
+  path now, not a separate mechanism a task has to opt into: switching
+  between two tasks that share the default table (the common case) costs
+  nothing beyond the `CR3` read that finds nothing to change.
+- **`task_e` proves the binding is real, not merely stored.** Every
+  iteration it reads straight through the real virtual address
+  `address_space::PRIVATE_REGION_ADDR` — no physical-offset back door.
+  That only resolves to the expected value because a real `CR3` switch,
+  performed by the *ordinary timer-driven scheduler*, actually happened
+  immediately before `task_e` was resumed. If the binding were somehow
+  wrong, this wouldn't silently pass — either the value would be wrong
+  (caught by the `TaskAddressSpace` check below) or, if the private page
+  isn't mapped in whatever table turned out to be active, a real,
+  diagnosable page fault, the same "wrong is loud, not silent" property
+  guard-page stacks already established.
+- **`TaskAddressSpace` self-test check**: confirms `task_e`'s counter is
+  nonzero — i.e. it really ran, and really saw the correct value, not
+  once but on every one of however many iterations the tick budget gave
+  it (see the boot log above: `task_e` genuinely interleaves with
+  `task_a`/`task_b`, driven by the same real hardware timer).
+
+**Passed on its first boot — no bug found this time**, the same result as
+the address-space work it builds on. This makes real sense in hindsight:
+`AddressSpace::new()`'s full-clone-plus-one-private-page design already
+guarantees every existing mapping (including every task's own guarded
+stack) resolves identically regardless of which table is active, which is
+exactly the property that makes it safe to switch `CR3` at an arbitrary
+point in the middle of an ordinary context switch — the same safety
+argument, just reused in a new call site rather than re-derived.
+
+**Scope, stated plainly**: one-way binding only (a task is bound at spawn
+time and never rebinds), no unbind/teardown path (a bound task's
+`AddressSpace` is never freed even if that task later exited — no task
+that owns one does exit in this pass anyway), and no process abstraction
+wraps the pairing (a `TaskSlot` just holds an `Option<PhysFrame>`, not a
+first-class "process" concept with its own PID namespace, exit status, or
+resource accounting).
+
 ## The GDT/segment-register bug (from the context-switching pass)
 
 Setting up a brand-new GDT and switching `CS` to it is not enough on
@@ -767,53 +867,57 @@ hardware.
 ## What this deliberately does not claim
 
 - **The context switch and task model are real but narrow.** Real task
-  creation, real task exit, and real, guard-page-protected stacks now
-  exist (see "Real task creation and exit" and "Real
-  guard-page-protected task stacks" above), but only within a fixed-size
+  creation, real task exit, real guard-page-protected stacks, and real
+  task-to-address-space binding now exist (see "Real task creation and
+  exit," "Real guard-page-protected task stacks," and "Real
+  task-to-address-space binding" above), but only within a fixed-size
   pool (`MAX_TASKS = 8`, one-to-one with `task_stack::MAX_SLOTS`); a
   slot's real pages, once mapped, stay mapped and reused for the
   kernel's lifetime rather than being unmapped between occupants (an
-  intentional simplification, not a leak — see that section); there is
-  still no blocking/IO-driven rescheduling (a task can only ever yield
-  by being timer-preempted), no task hierarchy (parent/child, wait/reap),
-  and no SMP (the switch code's soundness argument in `context.rs`/
-  `scheduler_bridge.rs` explicitly leans on "single core, only ever
-  touched with interrupts disabled" — a second CPU would break that
-  invariant and needs real synchronization, not attempted here). Handing
-  control back to the boot flow after a fixed tick budget is a hardcoded
-  sentinel (`BOOT_PID`), not the scheduler genuinely managing the
-  kernel's own boot thread as a task.
+  intentional simplification, not a leak — see that section); address-
+  space binding is one-way only (bound at spawn, never rebound, never
+  torn down); there is still no blocking/IO-driven rescheduling (a task
+  can only ever yield by being timer-preempted), no task hierarchy
+  (parent/child, wait/reap), and no SMP (the switch code's soundness
+  argument in `context.rs`/`scheduler_bridge.rs` explicitly leans on
+  "single core, only ever touched with interrupts disabled" — a second
+  CPU would break that invariant and needs real synchronization, not
+  attempted here). Handing control back to the boot flow after a fixed
+  tick budget is a hardcoded sentinel (`BOOT_PID`), not the scheduler
+  genuinely managing the kernel's own boot thread as a task.
 - **The page tables are real but narrow.** A second, genuinely
-  independent CR3-loadable address space now exists (see "Real multiple
-  address spaces" above), but only as a one-shot demonstration: it shares
-  every mapping with the original except one deliberately added private
-  page, nothing ties a `RunQueue` task to a particular `AddressSpace`, the
-  switch back is done by hand rather than as part of a general context
-  switch, and there is still no process/kernel privilege separation
-  (everything still runs at CPL0 in both address spaces). Real unmapping
-  now exists (`paging::unmap_page`, see "Real page unmapping" above), but
-  nothing in this kernel calls it except the self-test's own deliberate
-  demonstration — there's no general "free this VMA" path wired into
-  anything else yet. The physical allocator is still a single contiguous
-  arena (the largest usable region reported by the bootloader, minus the
-  handful of frames the paging bootstrap consumed) — a real multi-region
-  allocator is still
+  independent CR3-loadable address space now exists, and is now really
+  bound to a real scheduled task with the ordinary timer-driven
+  scheduler performing the real `CR3` switch (see "Real multiple address
+  spaces" and "Real task-to-address-space binding" above) — but there is
+  still no process abstraction around any of it (no PID, no exit
+  semantics tied to an address space, no copy-on-write), and no process/
+  kernel privilege separation (everything still runs at CPL0 in every
+  address space). Real unmapping exists (`paging::unmap_page`, see "Real
+  page unmapping" above), but nothing in this kernel calls it except the
+  self-test's own deliberate demonstration — there's no general "free
+  this VMA" path wired into anything else yet. The physical allocator is
+  still a single contiguous arena (the largest usable region reported by
+  the bootloader, minus the handful of frames the paging bootstrap
+  consumed) — a real multi-region allocator is still
   real, separate follow-on work, unchanged from `reference-rs/STATUS.md`'s
   original note.
 - **The kernel heap is fixed-size** (256 KiB bootstrap + 1 MiB real =
   1.25 MiB total, `allocator.rs`'s `BOOTSTRAP_HEAP_SIZE`/`REAL_HEAP_SIZE`)
   — real, page-mapped memory, but a hardcoded ceiling, not something that
   grows on demand past that.
-- **The ring-3 demo is real but narrow.** One hand-assembled program, four
-  fixed traps (three real round trips back to ring 3, one real exit) —
-  real, repeated privilege transitions, but still no general syscall ABI
-  (no argument-passing convention beyond "the value happens to be in
-  rax"), no process/exit semantics beyond this one hardcoded exit value,
-  and only ever one ring-3 program existing at a time.
-  `BootSequencer`'s `SyscallBoot` phase itself is still deliberately left
-  incomplete — a real trap-and-handle mechanism now exists, but there is
-  no general syscall ABI or process model behind it, and the live
-  self-test output says so rather than silently marking the phase done.
+- **The syscall ABI is real but small.** A real number→handler dispatch
+  table, real multi-argument passing, and real return values the ring-3
+  program genuinely uses now exist (see "Real, small syscall ABI" above)
+  — but it's a fixed, four-entry, compile-time table, not a dynamically
+  extensible registry; still one hand-assembled ring-3 program (no ELF
+  loader, no relocation, no process abstraction), no process/exit
+  semantics beyond one hardcoded exit value, and only ever one ring-3
+  program existing at a time. `BootSequencer`'s `SyscallBoot` phase
+  itself is still deliberately left incomplete — a real, if small,
+  syscall ABI now exists, but there is no process model or dynamically
+  extensible syscall registry behind it, and the live self-test output
+  says so rather than silently marking the phase done.
 - **NX/SMEP/SMAP are real but narrow.** NX and SMAP are both genuinely
   enforced and empirically exercised every boot (see "Real NX/SMEP/SMAP"
   above); SMEP is enabled, CPUID-gated correctly, and this pass was

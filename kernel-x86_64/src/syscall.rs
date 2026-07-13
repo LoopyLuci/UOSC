@@ -1,31 +1,36 @@
 //! A real ring-3 → ring-0 privilege transition: actual user-mode (CPL3)
 //! code, on real hardware, trapping into the kernel via `int 0x80` and
 //! being observed by a real handler — not a simulation of a syscall, and
-//! not CPL0 code merely pretending to be "userspace." This pass extends
-//! the original one-shot demo to a real round trip: the ring-3 program
-//! makes three real syscalls, is really resumed in ring 3 after each one,
-//! and only abandons ring 3 on a fourth, distinct "exit" trap.
+//! not CPL0 code merely pretending to be "userspace."
 //!
-//! **Scope, stated plainly**: this is a single, fixed, hand-assembled
-//! ring-3 program (no ELF loader, no process abstraction, no general
-//! syscall ABI), deliberately run *before* `scheduler_bridge::init()` so
-//! it never overlaps with real task switching. Combining a real
-//! privilege-level transition with real preemptive switching (a timer
-//! tick landing mid-ring-3, deciding to switch tasks, while running on
-//! the syscall entry's dedicated RSP0 stack) is real, additional
-//! complexity not attempted in this pass. Also still not attempted: more
-//! than one ring-3 program ever existing at once.
+//! **A real, small syscall ABI, not one hardcoded branch.** The original
+//! version of this module recognized exactly one syscall number
+//! (`999 = EXIT_SYSCALL`) via a single `cmp`/`je`, with every other number
+//! treated identically ("record whatever's in `rax`"). This pass replaces
+//! that with a real dispatch: a fixed table mapping syscall *number* to
+//! *handler function* ([`dispatch_syscall`]), real multi-argument passing
+//! (not just `rax` — three real arguments, shuffled into the System V
+//! calling convention's register slots before calling into Rust), and a
+//! real return value that the ring-3 program genuinely receives and uses
+//! (not just something the kernel happens to record).
 //!
-//! **NX/SMEP/SMAP** (`cpu_features.rs`) now apply for real: the user code
-//! page stays executable (real ring-3 code actually runs from it every
-//! boot) but the user stack page carries real NX, and the one kernel write
-//! into the user code page (copying `USER_PROGRAM` in, below) is wrapped
-//! in real `stac`/`clac` so it survives real `CR4.SMAP` being set. SMEP
-//! itself (forbidding the *kernel* from executing user-accessible pages)
-//! is enabled and was empirically fault-tested manually (see
-//! `cpu_features.rs`'s module docs and `STATUS.md`), but nothing in this
-//! codebase — including this module — ever attempts it as part of normal
-//! operation.
+//! **Scope, stated plainly**: this is still a single, fixed, hand-assembled
+//! ring-3 program (no ELF loader, no process abstraction) and the syscall
+//! table is a small, compile-time-fixed set of four numbers, not a
+//! dynamically extensible registry — "general" here means "a real
+//! number→handler dispatch with real multi-argument passing and real
+//! return values," not "a production-grade syscall surface." Deliberately
+//! run *before* `scheduler_bridge::init()` so it never overlaps with real
+//! task switching — combining a real privilege-level transition with real
+//! preemptive switching (a timer tick landing mid-ring-3) is real,
+//! additional complexity not attempted here. Also still not attempted:
+//! more than one ring-3 program ever existing at once.
+//!
+//! **NX/SMEP/SMAP** (`cpu_features.rs`) apply for real: the user code page
+//! stays executable (real ring-3 code actually runs from it every boot)
+//! but the user stack page carries real NX, and the one kernel write into
+//! the user code page (copying `USER_PROGRAM` in, below) is wrapped in
+//! real `stac`/`clac` so it survives real `CR4.SMAP` being set.
 //!
 //! ## The mechanism
 //!
@@ -38,34 +43,55 @@
 //! The ring-3 program itself is hand-assembled bytes (`USER_PROGRAM`), not
 //! a compiled Rust function copied by address, so its exact length is
 //! known with certainty when copying it into a freshly mapped
-//! user-accessible page — no guessing where a compiled function's
-//! boundary falls, and no risk of position-dependent relocations breaking
-//! when the bytes move to a new address. It makes four real traps in
-//! sequence: `mov eax,10; int 0x80`, `mov eax,20; int 0x80`,
-//! `mov eax,30; int 0x80`, then `mov eax,999; int 0x80` (999 =
-//! [`EXIT_SYSCALL`]), followed by a defensive `jmp $` that's only ever
-//! reached if the exit handling below has a bug.
+//! user-accessible page. It makes four real traps in sequence:
 //!
-//! `int 0x80`, with the IDT entry's DPL set to ring 3
-//! (`interrupts.rs`), traps into [`syscall_entry_stub`] — also naked,
-//! since reading the "syscall number" out of `rax` at the moment of the
-//! trap needs the real register file, which the typed
+//! 1. `mov eax, {SYS_ADD}; mov edi, 7; mov esi, 8; int 0x80` — a real,
+//!    two-argument syscall. The result (`15`) comes back in `rax`, and the
+//!    program saves it into `ebx` — nothing forces this beyond the ring-3
+//!    code itself actually trusting and using the returned value.
+//! 2. `mov eax, {SYS_ECHO}; mov edi, 1234; int 0x80` — a second, distinct
+//!    syscall number through the *same* dispatch mechanism, then
+//!    `add ebx, eax` folds this result into the running total (`1249`).
+//! 3. `mov eax, {SYS_REPORT}; mov edi, ebx; int 0x80` — reports the
+//!    ring-3-computed total back to the kernel as an argument (not a fixed
+//!    constant), so the boot self-test can check the *exact* value only
+//!    real, correct argument-passing and real, correct return values on
+//!    both prior calls could have produced.
+//! 4. `mov eax, {EXIT_SYSCALL}; int 0x80` — abandons ring 3 for good,
+//!    followed by a defensive `jmp $` never actually reached if exit
+//!    handling works.
+//!
+//! `int 0x80`, with the IDT entry's DPL set to ring 3 (`interrupts.rs`),
+//! traps into [`syscall_entry_stub`] — also naked, since reading the
+//! "syscall number" and arguments out of the real register file at the
+//! moment of the trap needs exactly that, which the typed
 //! `extern "x86-interrupt"` handler convention doesn't expose.
 //!
-//! **Two different real returns, not one**: for the three ordinary
-//! syscalls, the stub does the standard, textbook thing — record the
-//! value, then `iretq` using the *same* hardware-pushed interrupt frame
-//! the trap already left on the stack, resuming ring 3 at the very next
-//! instruction after `int 0x80`. Nothing needs to be reconstructed;
-//! that's the whole point of `iretq`. Only the fourth, `EXIT_SYSCALL`
-//! trap takes the other path — exactly like `scheduler_bridge.rs`'s
-//! `BOOT_PID` handback, it loads the kernel stack pointer [`enter_ring3`]
-//! saved and `ret`s straight back into `run_demo_syscall`'s caller,
-//! abandoning ring 3 for good (the trailing `jmp $` is consequently never
-//! actually reached).
+//! **The register shuffle**: ring-3 code places the syscall number in
+//! `rax` and up to three arguments in `rdi`/`rsi`/`rdx` — this kernel's
+//! own convention, not compatible with any other OS's ABI. To call
+//! [`dispatch_syscall`] (an ordinary `extern "C"` function, expecting its
+//! four `u64` arguments in `rdi`/`rsi`/`rdx`/`rcx` per the System V AMD64
+//! convention) the stub shuffles registers in dependency order — `rcx`
+//! first (from `rdx`, before `rdx` is overwritten), then `rdx` (from
+//! `rsi`), then `rsi` (from `rdi`), then finally `rdi` (from `rax`) — a
+//! real register permutation, not a coincidence of naming. The call's
+//! return value lands in `rax` automatically (the System V return
+//! convention), and since nothing overwrites `rax` again before `iretq`,
+//! ring 3 resumes with exactly that value already in place — no separate
+//! "write the return value back" step needed.
+//!
+//! **Two different real returns, not one**: for ordinary syscalls, the
+//! stub calls [`dispatch_syscall`] then `iretq`s using the *same*
+//! hardware-pushed interrupt frame the trap already left on the stack,
+//! resuming ring 3 at the very next instruction after `int 0x80`. Only
+//! `EXIT_SYSCALL` takes the other path — exactly like `scheduler_bridge.
+//! rs`'s `BOOT_PID` handback, it loads the kernel stack pointer
+//! [`enter_ring3`] saved and `ret`s straight back into `run_demo_syscall`'s
+//! caller, abandoning ring 3 for good.
 
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
@@ -75,30 +101,87 @@ pub const USER_CODE_ADDR: u64 = 0x_6666_6666_0000;
 pub const USER_STACK_ADDR: u64 = 0x_7777_7777_0000;
 const USER_STACK_SIZE: u64 = 4096;
 
-/// The one syscall number that means "abandon ring 3 for good," distinct
-/// from any of the three ordinary demo values (10/20/30) below.
+/// Real syscall numbers — a small, fixed table, not a dynamically
+/// extensible registry (see module docs for what "general" does and
+/// doesn't mean here).
+const SYS_ADD: u64 = 1;
+const SYS_ECHO: u64 = 2;
+const SYS_REPORT: u64 = 3;
 const EXIT_SYSCALL: u64 = 999;
 
-/// Four `mov eax, imm32` (B8 + 4-byte LE immediate) / `int 0x80` (CD 80)
-/// pairs — three ordinary syscalls (10, 20, 30), then the exit syscall
-/// (999 = 0x000003E7) — followed by a defensive `jmp $` (EB FE), never
-/// actually reached if exit handling works.
-const USER_PROGRAM: [u8; 30] = [
-    0xB8, 0x0A, 0x00, 0x00, 0x00, 0xCD, 0x80, // mov eax, 10  ; int 0x80
-    0xB8, 0x14, 0x00, 0x00, 0x00, 0xCD, 0x80, // mov eax, 20  ; int 0x80
-    0xB8, 0x1E, 0x00, 0x00, 0x00, 0xCD, 0x80, // mov eax, 30  ; int 0x80
-    0xB8, 0xE7, 0x03, 0x00, 0x00, 0xCD, 0x80, // mov eax, 999 ; int 0x80
+fn sys_add(a: u64, b: u64, _c: u64) -> u64 {
+    a.wrapping_add(b)
+}
+
+fn sys_echo(a: u64, _b: u64, _c: u64) -> u64 {
+    a
+}
+
+fn sys_report(a: u64, _b: u64, _c: u64) -> u64 {
+    REPORTED_VALUE.store(a, Ordering::SeqCst);
+    0
+}
+
+fn sys_exit(_a: u64, _b: u64, _c: u64) -> u64 {
+    serial_println!("[syscall] real int 0x80 EXIT trap from ring 3 — abandoning ring 3 for good");
+    0
+}
+
+/// The real number→handler dispatch — this is the actual "syscall table":
+/// a fixed-size array indexed by matching on `number`, each entry a real
+/// function pointer, not one hardcoded comparison. Unknown numbers return
+/// `u64::MAX` rather than panicking or silently doing nothing — a real,
+/// if minimal, error convention.
+extern "C" fn dispatch_syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
+    let handler: fn(u64, u64, u64) -> u64 = match number {
+        SYS_ADD => sys_add,
+        SYS_ECHO => sys_echo,
+        SYS_REPORT => sys_report,
+        EXIT_SYSCALL => sys_exit,
+        _ => {
+            serial_println!("[syscall] unknown syscall number {number} — returning u64::MAX");
+            return u64::MAX;
+        }
+    };
+    let result = handler(arg0, arg1, arg2);
+    if number != EXIT_SYSCALL {
+        serial_println!("[syscall] real int 0x80 trap from ring 3: number={number} arg0={arg0} arg1={arg1} -> {result}");
+    }
+    result
+}
+
+/// Real, hand-assembled machine code for four traps, each with real
+/// arguments — see module docs for exactly what each does and why. Encoded
+/// by hand (`mov r32,imm32` = `B8+reg imm32`; `mov r/m32,r32` = `89 /r`;
+/// `add r/m32,r32` = `01 /r`; `int 0x80` = `CD 80`), verified against the
+/// exact values the boot self-test expects to observe.
+const USER_PROGRAM: [u8; 51] = [
+    0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_ADD)
+    0xBF, 0x07, 0x00, 0x00, 0x00, // mov edi, 7
+    0xBE, 0x08, 0x00, 0x00, 0x00, // mov esi, 8
+    0xCD, 0x80, // int 0x80          -> rax = 15
+    0x89, 0xC3, // mov ebx, eax      ; ebx = 15
+    0xB8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2 (SYS_ECHO)
+    0xBF, 0xD2, 0x04, 0x00, 0x00, // mov edi, 1234
+    0xCD, 0x80, // int 0x80          -> rax = 1234
+    0x01, 0xC3, // add ebx, eax      ; ebx = 15 + 1234 = 1249
+    0xB8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3 (SYS_REPORT)
+    0x89, 0xDF, // mov edi, ebx      ; report 1249
+    0xCD, 0x80, // int 0x80
+    0xB8, 0xE7, 0x03, 0x00, 0x00, // mov eax, 999 (EXIT_SYSCALL)
+    0xCD, 0x80, // int 0x80
     0xEB, 0xFE, // jmp $  (defensive; never reached)
 ];
 
 static mut KERNEL_RETURN_RSP: u64 = 0;
 
-/// The three ordinary syscall values actually observed, in trap order —
-/// read back by the boot self-test to confirm the real round trip really
-/// happened (ring 3 really resumed and really made each subsequent trap),
-/// not just that one syscall fired.
-static OBSERVED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static OBSERVED_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// The value the ring-3 program reported via `SYS_REPORT`, computed
+/// entirely in ring 3 from two real syscall return values (`15` from
+/// `SYS_ADD(7, 8)`, `1234` echoed back, summed to `1249`). Read back by
+/// the boot self-test — a wrong value here means either a real argument
+/// wasn't delivered correctly or a real return value wasn't, not merely
+/// that some fixed constant round-tripped.
+static REPORTED_VALUE: AtomicU64 = AtomicU64::new(0);
 
 /// Drops the CPU to CPL3 for the first time, saving the current (kernel)
 /// execution context first so [`syscall_entry_stub`] can later abandon
@@ -132,15 +215,15 @@ unsafe extern "C" fn enter_ring3(user_code: u64, user_stack_top: u64, user_cs: u
 }
 
 /// The raw IDT handler for vector `0x80`, installed directly by address
-/// (`interrupts.rs`, since reading `rax` needs the real register file, not
-/// the typed `extern "x86-interrupt"` frame). Branches on the trapped
-/// `rax` *before* calling into Rust, since `record_syscall` (a normal
-/// `extern "C"` function) is free to clobber `rax` as scratch — relying on
-/// it surviving the call would be a real bug waiting to happen, not a
-/// hypothetical one.
+/// (`interrupts.rs`, since reading the real register file at the trap
+/// needs exactly that, not the typed `extern "x86-interrupt"` frame).
+/// Branches on the trapped `rax` *before* the register shuffle/call —
+/// `dispatch_syscall` (a normal `extern "C"` function) is free to clobber
+/// any caller-saved register, so relying on `rax` surviving the call
+/// would be a real bug waiting to happen, not a hypothetical one.
 ///
-/// **A second real bug found building the original one-shot version of
-/// this** (still relevant to the exit path below): the IDT entry is (by
+/// **A real bug found building the original one-shot version of this**
+/// (still relevant to the exit path below): the IDT entry is (by
 /// `set_handler_addr`'s own documented default) an *interrupt* gate,
 /// which clears `IF` automatically on entry — normally undone by the
 /// `iretq` the *continue* path below already performs. The *exit* path
@@ -153,17 +236,28 @@ pub unsafe extern "C" fn syscall_entry_stub() {
     naked_asm!(
         "cmp eax, {exit}",
         "je 3f",
-        // --- Continue path: record, then iretq using the interrupt
-        // frame the trap already pushed — no reconstruction needed,
-        // this is exactly what a normal interrupt return does. ---
-        "mov rdi, rax",
-        "call {handler}",
+        // --- Continue path: shuffle rax/rdi/rsi/rdx (our own
+        // number/arg0/arg1/arg2 convention) into rdi/rsi/rdx/rcx (System
+        // V's 1st-4th call-argument registers) in dependency order, call
+        // dispatch_syscall, then iretq using the interrupt frame the trap
+        // already pushed — no reconstruction needed. The call's return
+        // value is already in rax when iretq runs, which is exactly what
+        // ring 3 sees as int 0x80's "result." ---
+        "mov rcx, rdx", // rcx = arg2
+        "mov rdx, rsi", // rdx = arg1
+        "mov rsi, rdi", // rsi = arg0
+        "mov rdi, rax", // rdi = number
+        "call {dispatch}",
         "iretq",
-        // --- Exit path: record, then abandon ring 3 and resume the
-        // kernel context enter_ring3 saved. ---
+        // --- Exit path: same shuffle and dispatch (for its log line and
+        // uniform handling), then abandon ring 3 and resume the kernel
+        // context enter_ring3 saved. ---
         "3:",
+        "mov rcx, rdx",
+        "mov rdx, rsi",
+        "mov rsi, rdi",
         "mov rdi, rax",
-        "call {handler}",
+        "call {dispatch}",
         "lea rax, [rip + {kernel_rsp}]",
         "mov rsp, [rax]",
         "pop r15",
@@ -175,31 +269,19 @@ pub unsafe extern "C" fn syscall_entry_stub() {
         "sti",
         "ret",
         exit = const EXIT_SYSCALL,
-        handler = sym record_syscall,
+        dispatch = sym dispatch_syscall,
         kernel_rsp = sym KERNEL_RETURN_RSP,
     )
 }
 
-extern "C" fn record_syscall(number: u64) {
-    if number == EXIT_SYSCALL {
-        serial_println!("[syscall] real int 0x80 EXIT trap from ring 3 — abandoning ring 3 for good");
-        return;
-    }
-    let idx = OBSERVED_COUNT.fetch_add(1, Ordering::SeqCst);
-    if idx < OBSERVED.len() {
-        OBSERVED[idx].store(number, Ordering::SeqCst);
-    }
-    serial_println!("[syscall] real int 0x80 trap from ring 3, rax={number} — returning to ring 3");
-}
-
 /// Maps a real user-accessible code page and stack page, copies the real
 /// hand-assembled ring-3 program into the code page, and actually drops
-/// to CPL3 to run it. The ring-3 program makes three ordinary syscalls
-/// (really resumed in ring 3 after each) and one exit syscall (which
-/// really abandons ring 3). Returns the three ordinary values observed,
-/// in trap order, once the exit syscall has resumed this kernel context —
-/// `None` if the pages couldn't be mapped (paging not yet initialized).
-pub fn run_demo_syscall() -> Option<[u64; 3]> {
+/// to CPL3 to run it. The ring-3 program makes two real, multi-argument
+/// syscalls, reports the value it computed from their real return values,
+/// then exits. Returns that reported value once the exit syscall has
+/// resumed this kernel context — `None` if the pages couldn't be mapped
+/// (paging not yet initialized).
+pub fn run_demo_syscall() -> Option<u64> {
     // The code page deliberately does *not* carry the NX flag — this is
     // the one page in the whole kernel that real ring-3 code must actually
     // execute out of. The stack page does: a user stack has no legitimate
@@ -241,9 +323,5 @@ pub fn run_demo_syscall() -> Option<[u64; 3]> {
         enter_ring3(USER_CODE_ADDR, user_stack_top, user_cs, user_ss);
     }
 
-    Some([
-        OBSERVED[0].load(Ordering::SeqCst),
-        OBSERVED[1].load(Ordering::SeqCst),
-        OBSERVED[2].load(Ordering::SeqCst),
-    ])
+    Some(REPORTED_VALUE.load(Ordering::SeqCst))
 }

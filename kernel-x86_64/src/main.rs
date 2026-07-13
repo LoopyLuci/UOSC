@@ -328,18 +328,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         address_space_ok,
     );
 
-    // --- Real ring-3 → ring-0 privilege transition, deliberately run
-    // before scheduler_bridge::init() below — see syscall.rs's module
-    // docs for why real preemption and this demo don't overlap in this
-    // pass. A real hand-assembled program runs at CPL3, makes three real
-    // syscalls (really resumed in ring 3 after each one via a real
-    // iretq), then a fourth "exit" syscall that really abandons ring 3
-    // for good. Passing requires all three ordinary values to have been
-    // observed, in order — proof the round trip genuinely repeated, not
-    // just that one trap fired. ---
-    let syscall_ok = syscall::run_demo_syscall() == Some([10, 20, 30]);
+    // --- Real ring-3 → ring-0 privilege transition through a real, small
+    // syscall ABI, deliberately run before scheduler_bridge::init() below
+    // — see syscall.rs's module docs for why real preemption and this
+    // demo don't overlap in this pass. A real hand-assembled program runs
+    // at CPL3, calls SYS_ADD(7, 8) and SYS_ECHO(1234) — two real
+    // multi-argument syscalls through one real dispatch table, each really
+    // resumed in ring 3 via a real iretq — sums their real return values
+    // (15 + 1234 = 1249) *in ring 3*, reports that computed sum back via a
+    // third syscall, then a fourth "exit" syscall really abandons ring 3
+    // for good. Passing requires the exact reported value, which only a
+    // genuinely correct round trip of both arguments *and* both return
+    // values could have produced — not just that some trap fired. ---
+    let syscall_ok = syscall::run_demo_syscall() == Some(1249);
     results.record(
-        "Syscall: real CPL3 code made 3 real round-trip syscalls + 1 real exit trap via int 0x80",
+        "Syscall: real CPL3 code made 2 real multi-argument syscalls + reported their real, ring-3-computed sum",
         syscall_ok,
     );
 
@@ -387,9 +390,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         seq.satisfies_ordering_invariant()
     );
     serial_println!(
-        "[boot] SyscallBoot: a real int 0x80 entry point now exists (see the Syscall check above) — \
-         BootSequencer's SyscallBoot phase itself is still not completed, since there is no general \
-         syscall ABI or process model behind it yet"
+        "[boot] SyscallBoot: a real int 0x80 entry point and a real, small number->handler syscall \
+         dispatch table now exist (see the Syscall check above) — BootSequencer's SyscallBoot phase \
+         itself is still not completed, since there is no process model or dynamically extensible \
+         syscall registry behind it yet, only a fixed, compile-time table"
     );
 
     // --- Let real hardware timer interrupts actually drive the real
@@ -418,6 +422,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "TaskReuse: a task spawned live at runtime ran, really reusing the exact same guard-page-protected \
          stack slot an exited task used",
         scheduler_bridge::task_reused_a_guarded_slot(),
+    );
+    results.record(
+        "TaskAddressSpace: a real scheduled task ran with the ordinary timer-driven scheduler really \
+         switching CR3 to its own bound address space",
+        scheduler_bridge::task_e_verified_own_address_space(),
     );
 
     serial_println!("\n=== UOSC boot self-test: {}/{} checks passed ===", results.passed, results.total);
