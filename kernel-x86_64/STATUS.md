@@ -48,7 +48,7 @@ UOSC x86-64 — real boot starting
 [memory] real usable region 0x1161000..0x7fe0000, using 28287 pages for PhysicalAllocator
 [PASS] Memory: real PhysicalAllocator over real bootloader memory map
 [PASS] Capability: real CapabilityBroker grants the issuer and denies a stranger
-[scheduler_bridge] real RunQueue initialized with 3 demo Normal-class tasks
+[scheduler_bridge] real RunQueue + 2 real task contexts initialized
 [PASS] SchedulerBoot: real RunQueue initialized
 [PASS] Sanctum: real vault created, entered, and region-isolated
 [PASS] SanctumBoot phase
@@ -56,20 +56,26 @@ UOSC x86-64 — real boot starting
 [PASS] IpcBoot phase
 [boot] BootSequencer ordering invariant holds: true
 [boot] SyscallBoot intentionally left incomplete — no real syscall entry point in this pass
-[scheduler_bridge] tick 50: real RunQueue picked pid 2
-[scheduler_bridge] tick 100: real RunQueue picked pid 1
-[scheduler_bridge] tick 150: real RunQueue picked pid 0
-... (round-robin continues, matching CFS fairness — the same property
-     Scheduler.lean/SchedulerN.lean prove and scheduler.rs's tests check —
-     now observed from a real hardware timer, not a test harness)
-[PASS] Scheduler: real hardware timer interrupts drove RunQueue, every demo task ran
+[task_a] real context switch resumed me, iteration 20
+[task_b] real context switch resumed me, iteration 20
+[task_a] real context switch resumed me, iteration 40
+[task_b] real context switch resumed me, iteration 40
+[task_b] real context switch resumed me, iteration 60
+[task_a] real context switch resumed me, iteration 60
+... (task_a/task_b keep alternating — real interleaving from real,
+     hardware-timer-driven context switches, not a hardcoded print order —
+     through iteration 200 each)
+[PASS] Scheduler: real context switches actually ran both kernel tasks, driven by the real hardware timer
 
 === UOSC boot self-test: 10/10 checks passed ===
 ```
 
 QEMU's process exit code: `33`, which decodes (per `isa-debug-exit`'s
 `(value << 1) | 1` convention) to `ExitCode::Success = 0x10` — a real,
-scriptable pass signal, not a human reading a terminal.
+scriptable pass signal, not a human reading a terminal. Reproduced 3
+consecutive independent runs, byte-for-byte identical pass/fail shape
+each time (exact interleaving of task_a/task_b lines varies run to run,
+as real interrupt timing means it should).
 
 ## What actually happens at boot, and what code runs it
 
@@ -97,17 +103,57 @@ scriptable pass signal, not a human reading a terminal.
    confirm inside-region access and outside-region denial; create a port,
    send and receive a capability-checked message) against real allocated
    state, not test fixtures.
-6. **Real hardware-timer-driven scheduling**: the PIT fires a real
-   interrupt at 200 Hz; each one calls into `scheduler_bridge.rs`, which
-   runs the real `uosc_core::scheduler::RunQueue::pick_next_task` /
-   `update_vruntime` — the exact code `Scheduler.lean`'s two-task proof and
-   `SchedulerN.lean`'s general n-task proof cover. The tick log above shows
-   the real, observed round-robin fairness pattern (pid 2, 1, 0, repeating)
-   that those proofs guarantee.
+6. **Real hardware-timer-driven scheduling, with a real context switch.**
+   The PIT fires a real interrupt at 200 Hz; each one calls into
+   `scheduler_bridge.rs`, which runs the real
+   `uosc_core::scheduler::RunQueue::pick_next_task`/`update_vruntime` — the
+   exact code `Scheduler.lean`'s two-task proof and `SchedulerN.lean`'s
+   general n-task proof cover — and now, when that decision actually
+   changes which task should run, calls `context::switch_to` to really
+   switch the CPU to it. See "Real context switching" below for how.
 7. **`uosc_core::boot::BootSequencer`** tracks real phase completion as
    each step above finishes, and `satisfies_ordering_invariant()` — the
    same function `Boot.lean` proves preserves Property 10 — is checked live
    at the end, not just in a unit test.
+
+## Real context switching
+
+`context.rs` is new this pass. Two dedicated kernel tasks (`task_a`,
+`task_b` in `scheduler_bridge.rs`), each with its own real 16 KiB stack,
+are genuinely, physically switched between — a real save/restore of the
+stack pointer and callee-saved registers (`rbp`, `rbx`, `r12`–`r15`) via a
+hand-written naked-`asm!` `switch_to` routine, not a simulation of
+switching. The mechanism, in short (full reasoning is in `context.rs`'s
+module docs):
+
+- A task being suspended is *not* resumed later via `iretq`. It's resumed
+  via a second `ret` out of `switch_to` itself, landing right back inside
+  `on_timer_tick`/`timer_interrupt_handler` on that task's own stack, with
+  its original hardware interrupt frame still intact underneath. Only
+  *then* does the ISR's own epilogue run its `iretq`, restoring that
+  task's flags and resuming its normal code exactly where it left off.
+- A task's *first* ever resumption has no earlier `call switch_to` to
+  return into, so its stack is pre-built (`init_stack`) to `ret` into a
+  small trampoline that does `sti` (nothing has gone through a real
+  `iretq` for this task yet to otherwise restore that flag) and then jumps
+  straight into its entry function.
+- `interrupts.rs`'s timer handler was reordered to send the PIC's EOI
+  *before* calling into the scheduler, not after — `on_timer_tick` may not
+  return for many ticks once it switches away, and the 8259 PIC won't
+  raise IRQ0 again until EOI'd, so sending it after would have silently
+  stalled the timer for whichever task ends up running.
+- `serial.rs`'s `_print` now wraps its lock in
+  `x86_64::instructions::interrupts::without_interrupts` — real
+  preemption means task code can be switched out mid-print while holding
+  that lock, and the task switched into may want it too; a real deadlock,
+  not a hypothetical one, the first time both tasks call
+  `serial_println!` around the same time.
+
+**Observed result**: `task_a` and `task_b` print alternately, genuinely
+interleaved by real interrupt timing (see the boot output above), each
+having independently reached iteration 200 by the time the tick budget
+hands control back to the boot flow. No double fault, no triple fault, on
+any of 3 independent runs.
 
 ## The one real bug this pass found and fixed
 
@@ -129,15 +175,16 @@ hardware.
 
 ## What this deliberately does not claim
 
-- **No real context switch.** `scheduler_bridge.rs` drives real scheduling
-  *decisions* — `pick_next_task`/`update_vruntime` genuinely run against
-  real demo tasks on every real hardware tick — but does not save/restore
-  a second independent register and stack state and jump between two
-  actually-running instruction streams. That's a substantial, separate,
-  assembly-heavy undertaking (per-task kernel stacks, a `switch_to`
-  routine, careful interrupt-safety around the switch itself) with real
-  risk of a dangerous bug (a bad stack swap triple-faults the machine) if
-  rushed — not attempted here. See `scheduler_bridge.rs`'s own doc comment.
+- **The context switch is real but narrow.** Exactly two statically
+  defined kernel tasks exist; there is no task creation, no task exit, no
+  blocking/IO-driven rescheduling (a task can only ever yield by being
+  timer-preempted), and no SMP (the switch code's soundness argument in
+  `context.rs`/`scheduler_bridge.rs` explicitly leans on "single core,
+  only ever touched with interrupts disabled" — a second CPU would break
+  that invariant and needs real synchronization, not attempted here).
+  Handing control back to the boot flow after a fixed tick budget is a
+  hardcoded sentinel (`BOOT_PID`), not the scheduler genuinely managing
+  the kernel's own boot thread as a task.
 - **No hardware page tables.** CR3 still points at whatever mapping the
   bootloader set up (identity or offset-mapped, per `bootloader_api`'s own
   default). `uosc_core::memory::PageTable` remains the in-memory policy

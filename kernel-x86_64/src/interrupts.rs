@@ -67,10 +67,16 @@ extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFrame, e
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    crate::scheduler_bridge::on_timer_tick();
+    // EOI must come first, not last: `on_timer_tick` may perform a real
+    // context switch (see `context.rs`) and not return here for many
+    // ticks, until this exact task is resumed. The PIC won't raise IRQ0
+    // again until it's EOI'd, so sending it after the tick logic would
+    // silently stall every further timer interrupt for whichever task
+    // ends up running in the meantime.
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer as u8);
     }
+    crate::scheduler_bridge::on_timer_tick();
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {

@@ -24,7 +24,16 @@ pub fn init() {
 
 #[doc(hidden)]
 pub fn _print(args: core::fmt::Arguments) {
-    SERIAL1.lock().write_fmt(args).expect("serial write failed");
+    // Real preemption (see `context.rs`) means task code can be switched
+    // out mid-print while holding this lock, and the task switched into
+    // may want it too — a real deadlock, not a hypothetical one, as soon
+    // as two tasks both call `serial_println!`. Disabling interrupts
+    // around the critical section guarantees this can't be preempted
+    // while holding the lock, since preemption only ever happens on a
+    // timer interrupt.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SERIAL1.lock().write_fmt(args).expect("serial write failed");
+    });
 }
 
 #[macro_export]

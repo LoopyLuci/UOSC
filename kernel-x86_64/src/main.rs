@@ -15,10 +15,16 @@
 //! still points at the bootloader's identity/offset mapping — the virtual
 //! side of `uosc_core::memory` remains the in-memory policy model it
 //! already was, not a hardware page-walker, exactly as `reference-rs`'s
-//! `STATUS.md` already said); no real context switch between independently
-//! running tasks (`scheduler_bridge.rs` explains why); no userspace, no
-//! syscall entry point, no filesystem, no network. This is a real boot to
-//! a real self-test, not a usable operating system.
+//! `STATUS.md` already said); no userspace, no syscall entry point, no
+//! filesystem, no network. This is a real boot to a real self-test, not a
+//! usable operating system.
+//!
+//! It does now include a real context switch: `context.rs` +
+//! `scheduler_bridge.rs` genuinely save/restore two independently-running
+//! kernel tasks' stack pointers and callee-saved registers, driven by the
+//! real hardware timer and the real `RunQueue` scheduling decision — see
+//! `context.rs`'s module docs for exactly how that's safe to do from
+//! inside an interrupt handler.
 
 #![no_std]
 #![no_main]
@@ -27,6 +33,7 @@
 extern crate alloc;
 
 mod allocator;
+mod context;
 mod gdt;
 mod interrupts;
 mod pit;
@@ -191,13 +198,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
 
     // --- Let real hardware timer interrupts actually drive the real
-    // scheduler for a while, then check every demo task really ran ---
+    // scheduler for a while. This loop's own execution context is what
+    // gets suspended by the very first real context switch (see
+    // `context.rs`) — this `hlt()` call is where kernel_main's flow
+    // pauses until `scheduler_bridge`'s tick budget hands control back,
+    // at which point this loop resumes exactly here and keeps counting
+    // down, completely transparently. ---
     for _ in 0..1000 {
         x86_64::instructions::hlt();
     }
     results.record(
-        "Scheduler: real hardware timer interrupts drove RunQueue, every demo task ran",
-        scheduler_bridge::ran_every_demo_task_at_least_once(),
+        "Scheduler: real context switches actually ran both kernel tasks, driven by the real hardware timer",
+        scheduler_bridge::both_tasks_made_real_progress(),
     );
 
     serial_println!("\n=== UOSC boot self-test: {}/{} checks passed ===", results.passed, results.total);

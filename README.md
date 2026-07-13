@@ -32,7 +32,7 @@ what's real.
 |---|---|---|
 | [`reference-rs/`](reference-rs/) | Rust port of the portable logic in 8 of the ~11 `.ti` files (capability, memory, ipc, scheduler, sanctum, boot, timer, console) | `cargo test` → **64 passed, 0 failed**; `cargo clippy` → 0 warnings. See [`reference-rs/STATUS.md`](reference-rs/STATUS.md) for the 10 real bugs found in the Titan spec while porting it. |
 | [`proofs-lean4/`](proofs-lean4/) | Real Lean 4 re-hosting of `proofs/kernel_security.ax`'s 10 theorems | `lean <file>.lean` on all six `.lean` files → all exit 0. **8 of 10** theorems have a real machine-checked result (one of them — Property 7 — turned out to be *false as originally stated*; see [`proofs-lean4/README.md`](proofs-lean4/README.md)). |
-| [`kernel-x86_64/`](kernel-x86_64/) | A real bootable kernel binary built on `reference-rs`, using `bootloader_api` + a real GDT/IDT/PIC/PIT | Boots in QEMU (BIOS path, verified this pass) and runs a 10-check self-test against real hardware interrupts and a real physical memory map. **10/10 checks pass.** See [`kernel-x86_64/STATUS.md`](kernel-x86_64/STATUS.md) for the exact command and verbatim boot output, including a real GDT bug this pass found and fixed. |
+| [`kernel-x86_64/`](kernel-x86_64/) | A real bootable kernel binary built on `reference-rs`, using `bootloader_api` + a real GDT/IDT/PIC/PIT, with a real context switch between two independently-running kernel tasks | Boots in QEMU (BIOS path) and runs a 10-check self-test against real hardware interrupts, a real physical memory map, and a real hardware-timer-driven context switch. **10/10 checks pass**, reproduced across multiple independent runs. See [`kernel-x86_64/STATUS.md`](kernel-x86_64/STATUS.md) for the exact command, verbatim boot output, the real GDT bug found and fixed along the way, and how the context switch itself works. |
 
 Nothing above is described as "complete" in the sense the old table below
 used the word — each status file says explicitly what is and isn't
@@ -49,11 +49,14 @@ covered, and why.
   in `kernel_security.ax` — need a real operational semantics of
   hardware/concurrency that doesn't exist anywhere in this codebase.
 - SMP, a real syscall entry point, userspace, a filesystem, a network
-  stack, real hardware page tables, real context switching between
-  independently-scheduled tasks, RISC-V/AArch64 ports, post-quantum
+  stack, real hardware page tables, RISC-V/AArch64 ports, post-quantum
   crypto, secure boot, live patching, a federation protocol — none of
   this exists yet in any form, real or aspirational-but-labeled-as-such.
   Each is real, substantial, separate engineering, not a checkbox.
+  (Context switching between two independently-scheduled kernel tasks
+  *does* now exist for real — see the table above — but only between
+  exactly those two static tasks; general task creation/exit and SMP are
+  still on this list.)
 
 ## Directory structure
 
