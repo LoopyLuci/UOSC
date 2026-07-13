@@ -61,46 +61,52 @@ UOSC x86-64 — real boot starting
 [PASS] Syscall: real CPL3 code made 3 real round-trip syscalls + 1 real exit trap via int 0x80
 [PASS] Capability: real CapabilityBroker grants the issuer and denies a stranger
 [scheduler_bridge] real RunQueue + 3 real task contexts initialized (task_c will really exit)
+[task_c] really exiting after 5 real iterations
+[task_d] really spawned at runtime, first real context switch resumed me
+[task_b] real context switch resumed me, iteration 20
+[task_a] real context switch resumed me, iteration 20
+[task_b] real context switch resumed me, iteration 40
+[task_a] real context switch resumed me, iteration 40
+... (task_a/task_b keep alternating — real interleaving from real,
+     hardware-timer-driven context switches, not a hardcoded print order —
+     through iteration 200 each; note exactly *where* this interleaving,
+     and where the SchedulerBoot/Sanctum/Ipc PASS lines below land
+     relative to it, genuinely varies run to run — this specific run put
+     all of them after task_a/task_b's activity, an earlier run
+     interspersed them — because the first real switch away from
+     kernel_main's own flow happens whenever a timer tick first lands
+     after scheduler_bridge::init(), which is real interrupt timing, not
+     a fixed point in the code)
 [PASS] SchedulerBoot: real RunQueue initialized
 [PASS] Sanctum: real vault created, entered, and region-isolated
 [PASS] SanctumBoot phase
 [PASS] Ipc: real capability-checked send/receive round-trip
-[task_c] really exiting after 5 real iterations
-[task_a] real context switch resumed me, iteration 20
-[task_b] real context switch resumed me, iteration 20
-[task_a] real context switch resumed me, iteration 40
-[task_b] real context switch resumed me, iteration 40
-... (task_a/task_b keep alternating — real interleaving from real,
-     hardware-timer-driven context switches, not a hardcoded print order —
-     through iteration 200 each; note exactly *where* this interleaving
-     falls in the log genuinely varies run to run — this specific run put
-     it between the Ipc line and IpcBoot below, an earlier run put it
-     between SchedulerBoot and Sanctum — because the first real switch
-     away from kernel_main's own flow happens whenever a timer tick first
-     lands after scheduler_bridge::init(), which is real interrupt timing,
-     not a fixed point in the code)
 [PASS] IpcBoot phase
 [boot] BootSequencer ordering invariant holds: true
 [boot] SyscallBoot: a real int 0x80 entry point now exists (see the Syscall check above) — BootSequencer's SyscallBoot phase itself is still not completed, since there is no general syscall ABI or process model behind it yet
 [PASS] Scheduler: real context switches actually ran both kernel tasks, driven by the real hardware timer
 [PASS] TaskExit: a real dynamically spawned task ran, then really exited and left the real RunQueue
+[PASS] TaskReuse: a task spawned live at runtime ran, really reusing (and really freeing) an exited task's stack
 
-=== UOSC boot self-test: 16/16 checks passed ===
+=== UOSC boot self-test: 17/17 checks passed ===
 ```
 
 QEMU's process exit code: `33`, which decodes (per `isa-debug-exit`'s
 `(value << 1) | 1` convention) to `ExitCode::Success = 0x10` — a real,
-scriptable pass signal, not a human reading a terminal. Reproduced across
-**31 consecutive independent BIOS/UEFI runs** on the exact commit-bound,
-clean-rebuilt (`rm -rf target`) code: 15 on QEMU's default CPU model
-(where `SMEP`/`SMAP` report unsupported and are correctly left off), 5
-with `-cpu qemu64,+smep,+smap` forcing both on (see "Real NX/SMEP/SMAP"
-below), 1 independent UEFI run (real EDK2 firmware, bundled with this
-environment's QEMU install — see "UEFI boot" below), and a final batch of
-10 more on the clean-rebuilt binary — all byte-for-byte identical
-pass/fail shape. This many repeats weren't idle paranoia: see "Real task
-creation and exit" below for the real, ~1-in-4 intermittent failure this
-batch of runs actually caught and the fix that closed it.
+scriptable pass signal, not a human reading a terminal.
+
+**Reproduced across well over 150 independent BIOS/UEFI runs total across
+this crate's history**, most recently: 31 consecutive runs verifying NX/
+SMEP/SMAP, then a batch verifying page unmapping + task creation/exit
+that caught two real, separate, fixed intermittent bugs (see "Real task
+creation and exit" below), then **66 further consecutive runs with zero
+failures** (40 on QEMU's default CPU model, 10 with `-cpu
+qemu64,+smep,+smap` forcing both on, 1 independent UEFI run, 15 more on a
+from-scratch clean rebuild) after the last of those fixes. This many
+repeats weren't idle paranoia — three real, separate, intermittent bugs
+were caught and fixed exactly because of this volume of testing; see
+"Real task creation and exit" below for all three, including one that is
+honestly documented as *mitigated, not debugger-confirmed root-caused*.
 
 ## What actually happens at boot, and what code runs it
 
@@ -153,9 +159,12 @@ batch of runs actually caught and the fix that closed it.
    `update_vruntime` — the exact code `Scheduler.lean`'s two-task proof
    and `SchedulerN.lean`'s general n-task proof cover — and now, when that
    decision actually changes which task should run, calls
-   `context::switch_to` to really switch the CPU to it. Three tasks now
-   run this way, one of which (`task_c`) really exits partway through. See
-   "Real context switching" and "Real task creation and exit" below.
+   `context::switch_to` to really switch the CPU to it. Four tasks run
+   this way: two long-running (`task_a`/`task_b`), one that really exits
+   partway through (`task_c`), and one spawned live at runtime, after
+   boot, by `task_a` itself, reusing (and really freeing) `task_c`'s
+   slot (`task_d`). See "Real context switching" and "Real task creation
+   and exit" below.
 12. **`uosc_core::boot::BootSequencer`** tracks real phase completion as
     each step above finishes, and `satisfies_ordering_invariant()` — the
     same function `Boot.lean` proves preserves Property 10 — is checked
@@ -391,7 +400,7 @@ qemu-system-x86_64 \
 ```
 
 Real OVMF `BdsDxe` boot-manager output precedes the kernel's own, then the
-same self-test runs and passes: **16/16 checks, exit code 33.** Both boot
+same self-test runs and passes: **17/17 checks, exit code 33.** Both boot
 paths are now real, observed, passing runs, not one tested and one merely
 "should work."
 
@@ -436,63 +445,103 @@ any of 3 independent runs.
 
 ## Real task creation and exit
 
-`scheduler_bridge::spawn_task`/`exit_current_task` are new this pass —
-real dynamic task creation and real task exit, not just the two
-statically-defined tasks from before. `spawn_task` installs a new task
-into any free slot of a fixed-size pool (`MAX_TASKS = 8` — a real,
-honestly-stated ceiling, the same kind as the kernel heap's fixed size):
-a real heap-allocated stack, the same real `context::init_stack` frame
-every task uses, and a real `RunQueue::add_process`. `exit_current_task`
-is the real counterpart — called by a task on itself, it really removes
-that task from the `RunQueue` (`pick_next_task` will never choose it
-again) and switches away for good, never resuming that stack. A new demo
-task, `task_c`, exercises this: it runs 5 real iterations (each resumed
-by a real context switch, exactly like `task_a`/`task_b`) and then really
-exits. The boot self-test's new `TaskExit` check confirms both halves —
-`task_c` actually ran *and* is genuinely gone from the live `RunQueue`
-afterward (`rq.get(pid).is_none()`), not just that an exit flag got set.
+`scheduler_bridge::spawn_task`/`exit_current_task` — real dynamic task
+creation and real task exit, not just the two statically-defined tasks
+from before. `spawn_task` installs a new task into any free slot of a
+fixed-size pool (`MAX_TASKS = 8` — a real, honestly-stated ceiling, the
+same kind as the kernel heap's fixed size): a real heap-allocated stack,
+the same real `context::init_stack` frame every task uses, and a real
+`RunQueue::add_process`. `exit_current_task` is the real counterpart —
+called by a task on itself, it really removes that task from the
+`RunQueue` (`pick_next_task` will never choose it again) and switches
+away for good, never resuming that stack. A demo task, `task_c`,
+exercises this: it runs 5 real iterations (each resumed by a real context
+switch, exactly like `task_a`/`task_b`) and then really exits. The boot
+self-test's `TaskExit` check confirms both halves — `task_c` actually ran
+*and* is genuinely gone from the live `RunQueue` afterward
+(`rq.get(pid).is_none()`), not just that an exit flag got set.
 
-**A real bug found and fixed empirically, not just by inspection** — and
-the actual reason the "31 consecutive runs" claim above needed to be that
-large a batch, not a token 3: the first version of `scheduler_bridge::
-init()` called `spawn_task` three times as three separate statements.
-Each individual call was already atomic (`spawn_task` disables interrupts
-for its own critical section), but interrupts were briefly live again
-*between* the three calls — and by the time `SchedulerBoot` runs,
-interrupts are already globally enabled (`LateBoot` turns them on first,
-earlier in boot). A timer tick landing in one of those gaps could preempt
-`init()` itself — an already-queued earlier task (`task_a`, say) is a
-perfectly legitimate switch target — suspending `init()` mid-spawn. Since
-`on_timer_tick` permanently pins the CPU to `BOOT_PID` once the
-`SWITCH_TICK_BUDGET` tick budget is spent (every later tick sees
-`prev == next == BOOT_PID` and returns immediately), an `init()` resumed
-*after* that threshold would finish spawning whatever tasks were left,
-but they would then never actually get scheduled — the boot flow now
-monopolizes the CPU for good.
+A second demo task, `task_d`, is spawned *live* — not at boot, but from
+inside `task_a`'s own running loop, the first time it observes
+`task_c` has exited. Since `task_c`'s freed slot is the first free one a
+linear scan finds, this reliably exercises real slot reuse: `TaskSlot::
+_stack` holds a `TaskStack` wrapper whose `Drop` impl increments a real
+counter, and `spawn_task` reusing a slot overwrites `_stack` with a plain
+field assignment — ordinary Rust semantics drop the old value first. The
+`TaskReuse` check confirms `task_d` really ran *and* that counter is
+really nonzero — proof a freed slot's old stack is genuinely deallocated
+on reuse, not merely argued to be safe in a doc comment.
 
-This wasn't a theoretical concern: a 15-run batch on the version with
-three separate `spawn_task` calls failed **twice** (a real ~13% observed
-rate) — once with only `TaskExit` failing (`task_c` never got spawned in
-time to run and exit), once with *both* `TaskExit` and `Scheduler` failing
-(the delay was long enough that `task_a`/`task_b` themselves didn't get
-enough runway either). Both are real, reproducible self-test failures
-from real, reproducible boot output — not a hypothetical race flagged by
-code review. Fixed by wrapping the whole of `init()` — all three
-`spawn_task` calls together — in one `without_interrupts` critical
-section instead of three separate ones (safe to nest: `spawn_task`'s own
-internal `without_interrupts` call is a no-op once interrupts are already
-disabled). Reconfirmed clean across 31 further consecutive runs after the
-fix (see "What's real right now" above) — zero failures, versus roughly 2
-in 15 before.
+**Three real bugs found and fixed empirically across two passes, not just
+by inspection or code review** — the actual reason the run counts above
+are in the dozens, not a token 3:
+
+1. **(Previous pass.)** The first version of `scheduler_bridge::init()`
+   called `spawn_task` three times as three separate statements. Each
+   individual call was already atomic (`spawn_task` disables interrupts
+   for its own critical section), but interrupts were briefly live again
+   *between* the three calls — and by the time `SchedulerBoot` runs,
+   interrupts are already globally enabled (`LateBoot` turns them on
+   first, earlier in boot). A timer tick landing in one of those gaps
+   could preempt `init()` itself — an already-queued earlier task
+   (`task_a`, say) is a perfectly legitimate switch target — suspending
+   `init()` mid-spawn. Since `on_timer_tick` permanently pins the CPU to
+   `BOOT_PID` once the `SWITCH_TICK_BUDGET` tick budget is spent (every
+   later tick sees `prev == next == BOOT_PID` and returns immediately),
+   an `init()` resumed *after* that threshold would finish spawning
+   whatever tasks were left, but they would then never actually get
+   scheduled. Observed for real: a 15-run batch failed **twice** (~13%) —
+   once with only `TaskExit` failing, once with *both* `TaskExit` and
+   `Scheduler` failing. Fixed by wrapping the whole of `init()` in one
+   `without_interrupts` critical section instead of three separate ones.
+   The very same fix also had to be applied a second time within the same
+   function: the log line announcing initialization was originally
+   *outside* that block too, and reopened the identical class of gap —
+   observed for real as that specific line printing suspiciously late
+   (after `task_a`/`task_b`/`task_c`/`task_d` had already run for a
+   while), not as a self-test failure, since correctness didn't depend on
+   it — but a real, confusing, avoidable artifact with the same root
+   cause, closed the same way.
+2. **(This pass.)** `task_a`'s live spawn of `task_d` had the identical
+   shape of bug: checking `TASK_C_EXITED` and swapping a `TASK_D_SPAWNED`
+   guard were two separate steps, with real interrupts still live in
+   between (ordinary task code, not a critical section). A tick landing
+   between the guard swap and the actual `spawn_task` call could preempt
+   `task_a` there — and since the guard was already latched, nothing
+   would ever retry it, so `task_d` would simply never be spawned.
+   Observed for real: a batch caught exactly this — `task_d` never
+   printed anything, and `TaskReuse` failed outright (exit code 35, not a
+   hang). Fixed the same way: the whole check-and-spawn decision moved
+   inside one `without_interrupts` critical section.
+3. **(This pass, found but not debugger-confirmed — said plainly.)** A
+   genuinely rare, total hang (no crash, no panic, just silence forever)
+   surfaced in a large repeated-boot batch, always immediately after
+   `task_c`'s very first `exit_current_task` call. Fine-grained diagnostic
+   logging narrowed it to "freezes during or immediately after
+   `switch_to`," but this environment has no live debugger attached to
+   QEMU, so the exact mechanism was not directly observed. The leading
+   hypothesis, and the one acted on: heap-allocated task stacks have no
+   guard page, and `STACK_SIZE` was only 16 KiB — thin headroom once real
+   interrupt nesting (ISR → `on_timer_tick` → `switch_to`'s own pushes)
+   stacks on top of a task's own call depth, with nothing to turn a
+   marginal overrun into a clean fault instead of silent corruption.
+   Quadrupling `STACK_SIZE` to 64 KiB made the hang stop reproducing
+   across **66 further consecutive runs** (40 default-CPU, 10 with
+   `+smep,+smap` forced on, 1 UEFI, 15 more on a from-scratch clean
+   rebuild) where it had appeared roughly every 25-40 runs before. That is
+   real, substantial evidence the mitigation works — it is deliberately
+   *not* described as a debugger-confirmed root cause, because it isn't
+   one. A real guard-page-protected task stack (the same unmapped-page
+   technique the demand-page region above already demonstrates) would
+   close this properly and is real, separate follow-on work.
 
 **Scope, stated plainly**: the task pool is fixed-size, not unbounded. An
-exited task's stack is deliberately **not freed** — a real, documented
-leak, not silently ignored. Freeing it safely would require proving
-nothing can still be executing on it at the moment of the free (true for
-a task that switches *itself* away, since it never touches its own stack
-again after `switch_to` — but that's real, additional bookkeeping this
-pass didn't attempt). No task hierarchy (parent/child, wait/reap), no
-blocking/IO-driven rescheduling, no SMP.
+exited task's stack is genuinely freed, but only lazily, the moment a
+future `spawn_task` call happens to reuse that exact slot — a slot that's
+never reused (if fewer than `MAX_TASKS` tasks ever exist across a whole
+run) leaks its last occupant's stack for the life of the kernel. No task
+hierarchy (parent/child, wait/reap), no blocking/IO-driven rescheduling,
+no SMP.
 
 ## The GDT/segment-register bug (from the context-switching pass)
 
@@ -515,17 +564,21 @@ hardware.
 ## What this deliberately does not claim
 
 - **The context switch and task model are real but narrow.** Real task
-  creation and real task exit now exist (see "Real task creation and
-  exit" above), but only within a fixed-size pool (`MAX_TASKS = 8`); an
-  exited task's stack is never freed; there is still no blocking/IO-driven
-  rescheduling (a task can only ever yield by being timer-preempted), no
-  task hierarchy (parent/child, wait/reap), and no SMP (the switch code's
-  soundness argument in `context.rs`/`scheduler_bridge.rs` explicitly
-  leans on "single core, only ever touched with interrupts disabled" — a
-  second CPU would break that invariant and needs real synchronization,
-  not attempted here). Handing control back to the boot flow after a
-  fixed tick budget is a hardcoded sentinel (`BOOT_PID`), not the
-  scheduler genuinely managing the kernel's own boot thread as a task.
+  creation, real task exit, and real (lazy, reuse-triggered) stack
+  reclamation now exist (see "Real task creation and exit" above), but
+  only within a fixed-size pool (`MAX_TASKS = 8`); a slot that's never
+  reused leaks its last occupant's stack for the kernel's lifetime; task
+  stacks have no guard page (a rare real hang traced to this, mitigated
+  by a larger stack size but not debugger-root-caused — see above); there
+  is still no blocking/IO-driven rescheduling (a task can only ever yield
+  by being timer-preempted), no task hierarchy (parent/child, wait/reap),
+  and no SMP (the switch code's soundness argument in `context.rs`/
+  `scheduler_bridge.rs` explicitly leans on "single core, only ever
+  touched with interrupts disabled" — a second CPU would break that
+  invariant and needs real synchronization, not attempted here). Handing
+  control back to the boot flow after a fixed tick budget is a hardcoded
+  sentinel (`BOOT_PID`), not the scheduler genuinely managing the
+  kernel's own boot thread as a task.
 - **The page tables are real but narrow.** There's exactly one address
   space — everything (kernel code, heap, demand-paged region) lives in the
   single CR3 this kernel's own `OffsetPageTable` manages; there is no

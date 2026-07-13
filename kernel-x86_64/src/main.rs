@@ -382,6 +382,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "TaskExit: a real dynamically spawned task ran, then really exited and left the real RunQueue",
         scheduler_bridge::task_c_really_exited(),
     );
+    results.record(
+        "TaskReuse: a task spawned live at runtime ran, really reusing (and really freeing) an exited task's stack",
+        scheduler_bridge::task_reuse_freed_a_stack(),
+    );
 
     serial_println!("\n=== UOSC boot self-test: {}/{} checks passed ===", results.passed, results.total);
     if results.passed == results.total {
