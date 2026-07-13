@@ -27,48 +27,52 @@
 //! confirms both that it ran *and* that it's gone from the real queue
 //! afterward, not just that a flag got set.
 //!
-//! **A freed slot's stack really is freed, not merely leaked until the
-//! next reuse decides to care.** `exit_current_task` clears the slot's
-//! `pid` but deliberately leaves `_stack` populated — freeing it *there*
-//! would mean dropping the very stack the CPU is still running on, one
-//! instruction before jumping away from it. Instead, the drop happens the
-//! ordinary way: `TaskSlot::_stack` holds a [`TaskStack`], and the next
-//! [`spawn_task`] to claim that slot overwrites `_stack` with a new one —
-//! a plain Rust field assignment, which drops the old value first. Since
-//! nothing can be executing on an exited task's stack by the time a
-//! *different* task's `spawn_task` call runs (the exited task never
-//! resumes), this is genuinely safe, not just conveniently timed.
-//! `TaskStack`'s `Drop` impl increments a real counter so this is
-//! actually observed happening, not just argued to be true — see
-//! `task_d_entry`/[`task_reuse_freed_a_stack`].
+//! **Task stacks are now real, guard-page-protected page-table mappings,
+//! not heap-allocated `Box<[u8]>`s.** See `task_stack.rs`'s module docs for
+//! the full story — the short version: each of the `MAX_TASKS` array slots
+//! below (the same index used for both) owns a fixed virtual address range
+//! with a genuinely unmapped page directly beneath its stack, mapped once
+//! on first use and reused (not freed/reallocated) for the life of the
+//! kernel, since the slot itself was always a fixed-size resource anyway.
+//! [`task_reused_a_guarded_slot`] is the real proof this actually happens:
+//! it confirms `task_d` landed in the *exact same* guarded slot `task_c`'s
+//! stack used, not merely some slot.
 //!
-//! **A rare, real hang, found empirically and honestly not 100%
-//! root-caused.** A large repeated-boot batch (see `STATUS.md`) caught an
-//! intermittent (roughly 1-4%) total hang — no crash, no panic, just
-//! silence forever — always immediately after `task_c`'s very first
+//! **A rare, real hang, found empirically, mitigated, and — this pass —
+//! closed more rigorously.** A large repeated-boot batch (see `STATUS.md`)
+//! caught an intermittent (roughly 1-4%) total hang — no crash, no panic,
+//! just silence forever — always immediately after `task_c`'s very first
 //! `exit_current_task` call, right around its `switch_to` into whichever
 //! task was picked next. Fine-grained diagnostic logging narrowed it to
 //! "froze during or immediately after `switch_to`, before the resumed
-//! task's next real output" but couldn't pin the exact mechanism without
-//! a live debugger, which wasn't available in this environment. The
-//! leading hypothesis: heap-allocated task stacks have **no guard page**
-//! (unlike a normal kernel stack, there's nothing to make an overrun
-//! reliably fault instead of silently corrupting whatever heap allocation
-//! happens to sit next to it), and `STACK_SIZE` was only 16 KiB — thin
-//! headroom once real interrupt nesting (ISR → `on_timer_tick` →
-//! `switch_to`'s own pushes, potentially several layers deep depending on
-//! exactly when a task was last preempted) is stacked on top of a task's
-//! own call depth. Quadrupling `STACK_SIZE` to 64 KiB made the hang stop
-//! reproducing across 66 further consecutive runs (40 default-CPU + 10
-//! `+smep+smap` + 1 UEFI + 15 more on a from-scratch clean rebuild) where
-//! it had appeared roughly every 25-40 runs before. That's real,
-//! substantial evidence the fix works — it is not the same thing as a
-//! debugger-confirmed root cause, and this file says so rather than
-//! quietly upgrading "the failure rate dropped to zero across a large
-//! sample" into "proven fixed." A real guard-page-protected task stack
-//! (a dedicated virtual mapping with a deliberately unmapped page below
-//! it, the same technique `paging.rs`'s demand-page region already
-//! demonstrates works) would close this properly; not attempted here.
+//! task's next real output" but couldn't pin the exact mechanism without a
+//! live debugger, which wasn't available in this environment. The leading
+//! hypothesis at the time: heap-allocated task stacks had **no guard
+//! page** (unlike a normal kernel stack, there was nothing to make an
+//! overrun reliably fault instead of silently corrupting whatever heap
+//! allocation happened to sit next to it), and `STACK_SIZE` was only
+//! 16 KiB — thin headroom once real interrupt nesting (ISR →
+//! `on_timer_tick` → `switch_to`'s own pushes, potentially several layers
+//! deep depending on exactly when a task was last preempted) is stacked on
+//! top of a task's own call depth. Quadrupling the stack size to 64 KiB
+//! made the hang stop reproducing across 66 further consecutive runs,
+//! real, substantial evidence, but honestly not the same thing as a
+//! debugger-confirmed root cause.
+//!
+//! This pass replaces that heap-allocated mitigation with real
+//! guard-page-protected stacks (`task_stack.rs`): each task-pool slot now
+//! has a dedicated virtual mapping with a genuinely unmapped page directly
+//! below it, the same technique `paging.rs`'s demand-page region already
+//! demonstrates works. If the stack-headroom hypothesis was right, an
+//! overrun now reliably produces a real, diagnosable `#PF` panic instead
+//! of silent corruption — a strictly stronger guarantee than "the failure
+//! rate dropped in a large sample," and one that would surface *any* real
+//! overrun immediately and loudly rather than relying on generous sizing
+//! to make one merely rare. Still honestly stated: this closes the
+//! "silent corruption" failure mode structurally, but does not itself
+//! prove the original hang's mechanism was stack overrun — no debugger was
+//! available to confirm that historically, and none is available now
+//! either.
 //!
 //! **Scope, stated plainly**: the task pool is fixed-size
 //! (`MAX_TASKS`), not unbounded — the same honestly-stated ceiling as the
@@ -82,56 +86,42 @@
 //! driven rescheduling, no SMP, no task hierarchy (parent/child, wait/
 //! reap), no priorities beyond what `PriorityClass` already offers.
 
-use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 use uosc_core::scheduler::{PriorityClass, Process, ProcessState, RunQueue};
 
 use crate::context::{self, Context};
 use crate::serial_println;
+use crate::task_stack;
 
-const STACK_SIZE: usize = 64 * 1024;
 const BOOT_PID: u64 = u64::MAX;
 
 /// The fixed size of the real task pool — real task creation and exit
 /// exist, but only within this many concurrently-alive tasks at once, the
 /// same kind of honestly-stated ceiling as the kernel heap's fixed size.
-const MAX_TASKS: usize = 8;
+/// Defined in terms of [`task_stack::MAX_SLOTS`], not the other way
+/// around — see that module's docs.
+const MAX_TASKS: usize = task_stack::MAX_SLOTS;
 
 /// Real switching happens for this many ticks; after that, control is
 /// handed back to the boot flow so `main.rs` can finish its self-test.
 const SWITCH_TICK_BUDGET: u64 = 400;
 
-/// How many real `TaskStack`s have actually been dropped — real evidence
-/// a freed slot's old stack genuinely got deallocated on reuse, not just
-/// an assertion that it should have. See module docs.
-static STACKS_FREED: AtomicU64 = AtomicU64::new(0);
-
-/// A task's real heap-allocated stack, wrapped only so its `Drop` is
-/// observable — the allocation/deallocation itself is entirely ordinary
-/// `Box<[u8]>` behavior. The bytes themselves are never read back through
-/// this wrapper (the CPU accesses them directly via `rsp`, not through
-/// Rust); it exists purely to keep the allocation alive and observe when
-/// it goes away.
-#[allow(dead_code)]
-struct TaskStack(Box<[u8]>);
-
-impl Drop for TaskStack {
-    fn drop(&mut self) {
-        STACKS_FREED.fetch_add(1, Ordering::SeqCst);
-    }
-}
+/// Real proof of guarded-slot reuse for the boot self-test: the slot index
+/// (not pid — pids are never reused, slot indices are) that the last task
+/// to call [`exit_current_task`] used, and the slot index [`task_a_entry`]
+/// observed `task_d` land in when it spawned it. See
+/// [`task_reused_a_guarded_slot`].
+static TASK_EXIT_SLOT: Mutex<Option<usize>> = Mutex::new(None);
+static TASK_D_SPAWN_SLOT: Mutex<Option<usize>> = Mutex::new(None);
 
 struct TaskSlot {
     pid: Option<u64>,
     context: Context,
-    /// Kept alive for the task's lifetime; really freed the moment a
-    /// future `spawn_task` reuses this slot — see module docs.
-    _stack: Option<TaskStack>,
 }
 
 impl TaskSlot {
-    const EMPTY: TaskSlot = TaskSlot { pid: None, context: Context::EMPTY, _stack: None };
+    const EMPTY: TaskSlot = TaskSlot { pid: None, context: Context::EMPTY };
 }
 
 /// Only ever touched with interrupts disabled — either from inside the
@@ -184,7 +174,9 @@ extern "C" fn task_a_entry() -> ! {
         // section, exactly like `init()`'s fix above.
         x86_64::instructions::interrupts::without_interrupts(|| {
             if TASK_C_EXITED.load(Ordering::SeqCst) && !TASK_D_SPAWNED.swap(true, Ordering::SeqCst) {
-                spawn_task(task_d_entry);
+                if let Some(pid) = spawn_task(task_d_entry) {
+                    *TASK_D_SPAWN_SLOT.lock() = slot_index_for_pid(pid);
+                }
             }
         });
         x86_64::instructions::hlt();
@@ -249,10 +241,22 @@ fn context_rsp(pid: u64) -> u64 {
     }
 }
 
+/// Which array index (== which guarded `task_stack` slot) `pid` currently
+/// occupies — used only for the boot self-test's reuse proof. Must be
+/// called with interrupts already disabled (same requirement as every
+/// other `TASK_SLOTS` access).
+fn slot_index_for_pid(pid: u64) -> Option<usize> {
+    unsafe {
+        let slots: *const [TaskSlot; MAX_TASKS] = &raw const TASK_SLOTS;
+        (*slots).iter().position(|s| s.pid == Some(pid))
+    }
+}
+
 /// Installs `entry` as a new, really scheduled task in any free slot of
-/// the fixed-size pool: a real heap-allocated stack, a real
-/// [`context::init_stack`] frame, and a real `RunQueue::add_process`.
-/// Returns `None` if all `MAX_TASKS` real slots are already in use.
+/// the fixed-size pool: a real guard-page-protected stack (see
+/// `task_stack.rs`), a real [`context::init_stack`] frame, and a real
+/// `RunQueue::add_process`. Returns `None` if all `MAX_TASKS` real slots
+/// are already in use.
 ///
 /// Disables interrupts for its critical section — `TASK_SLOTS` is a plain
 /// `static mut`, and a timer tick landing mid-mutation (this can run with
@@ -270,22 +274,31 @@ fn context_rsp(pid: u64) -> u64 {
 /// control back, caught by inspection rather than by observing it happen.
 pub fn spawn_task(entry: extern "C" fn() -> !) -> Option<u64> {
     let pid = NEXT_PID.fetch_add(1, Ordering::SeqCst);
-    let mut stack: Box<[u8]> = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
-    let ctx = context::init_stack(&mut stack, entry);
 
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let installed = unsafe {
-            let slots: *mut [TaskSlot; MAX_TASKS] = &raw mut TASK_SLOTS;
-            (*slots).iter_mut().find(|s| s.pid.is_none()).map(|slot| {
-                slot.pid = Some(pid);
-                slot.context = ctx;
-                // If this slot is being reused, this assignment drops
-                // whichever TaskStack was here before — the real free
-                // TaskStack::drop counts.
-                slot._stack = Some(TaskStack(stack));
-            })
-        };
-        installed?;
+        let slots: *mut [TaskSlot; MAX_TASKS] = &raw mut TASK_SLOTS;
+        let free_index = unsafe { (*slots).iter().position(|s| s.pid.is_none()) }?;
+
+        // Real, guard-page-protected pages for this slot — mapped the
+        // first time this index is ever used, reused thereafter. See
+        // task_stack.rs.
+        let stack_top = task_stack::ensure_slot_mapped(free_index);
+        let stack_base = stack_top - task_stack::STACK_SIZE;
+
+        // Safety: this builds a transient &mut [u8] over the slot's
+        // dedicated, real mapped memory. Sound because nothing can be
+        // executing on a previous occupant's stack by the time a
+        // spawn_task call reuses this same slot index (an exited task
+        // never resumes — see exit_current_task's docs), the exact
+        // non-aliasing argument the old TaskStack wrapper relied on,
+        // just applied to a fixed mapped region instead of a heap Box.
+        let stack_slice = unsafe { core::slice::from_raw_parts_mut(stack_base as *mut u8, task_stack::STACK_SIZE as usize) };
+        let ctx = context::init_stack(stack_slice, entry);
+
+        unsafe {
+            (*slots)[free_index].pid = Some(pid);
+            (*slots)[free_index].context = ctx;
+        }
         if let Some(rq) = SCHEDULER.lock().as_mut() {
             rq.add_process(Process { pid, class: PriorityClass::Normal, state: ProcessState::Ready, vruntime: 0 });
         }
@@ -306,8 +319,9 @@ pub fn exit_current_task() -> ! {
     }
     unsafe {
         let slots: *mut [TaskSlot; MAX_TASKS] = &raw mut TASK_SLOTS;
-        if let Some(slot) = (*slots).iter_mut().find(|s| s.pid == Some(pid)) {
+        if let Some((idx, slot)) = (*slots).iter_mut().enumerate().find(|(_, s)| s.pid == Some(pid)) {
             slot.pid = None;
+            *TASK_EXIT_SLOT.lock() = Some(idx);
         }
     }
     TASK_C_EXITED.store(true, Ordering::SeqCst);
@@ -433,9 +447,10 @@ pub fn task_c_really_exited() -> bool {
 
 /// Read back for the boot self-test: did `task_d` — spawned live, at
 /// runtime, by `task_a`, only after `task_c` had already exited — really
-/// run, *and* did reusing `task_c`'s freed slot really drop its old
-/// `TaskStack`? Real proof that a freed slot's stack is genuinely
-/// deallocated on reuse, not merely argued to be safe.
-pub fn task_reuse_freed_a_stack() -> bool {
-    COUNTER_D.load(Ordering::SeqCst) > 0 && STACKS_FREED.load(Ordering::SeqCst) >= 1
+/// run, *and* did it really land in the exact same guarded `task_stack`
+/// slot `task_c`'s stack used (proof the real, page-mapped guarded region
+/// is genuinely reused, not that a fresh one happened to be picked)?
+pub fn task_reused_a_guarded_slot() -> bool {
+    let exit_slot = *TASK_EXIT_SLOT.lock();
+    COUNTER_D.load(Ordering::SeqCst) > 0 && exit_slot.is_some() && exit_slot == *TASK_D_SPAWN_SLOT.lock()
 }

@@ -44,7 +44,7 @@ qemu-system-x86_64 -drive format=raw,file=uosc-bios.img \
 ```
 UOSC x86-64 — real boot starting
 [cpu] NX=true (EFER.NXE) SMEP=false SMAP=false (CR4), each gated on a real CPUID check
-[memory] real usable region 0x1473000..0x7fe0000, using 27501 pages for the real PhysicalAllocator
+[memory] real usable region 0x1471000..0x7fe0000, using 27503 pages for the real PhysicalAllocator
 [PASS] CpuSecurity: real EFER.NXE/CR4.SMEP/CR4.SMAP match what CPUID said was supported
 [PASS] EarlyBoot: GDT + IDT installed
 [PASS] LateBoot: PIC/PIT/interrupts enabled
@@ -60,33 +60,37 @@ UOSC x86-64 — real boot starting
 [syscall] real int 0x80 EXIT trap from ring 3 — abandoning ring 3 for good
 [PASS] Syscall: real CPL3 code made 3 real round-trip syscalls + 1 real exit trap via int 0x80
 [PASS] Capability: real CapabilityBroker grants the issuer and denies a stranger
+[task_stack] slot 0: mapped a real 64 KiB guarded stack at 0x333333331000, real unmapped guard page at 0x333333330000
+[task_stack] slot 1: mapped a real 64 KiB guarded stack at 0x333333342000, real unmapped guard page at 0x333333341000
+[task_stack] slot 2: mapped a real 64 KiB guarded stack at 0x333333353000, real unmapped guard page at 0x333333352000
 [scheduler_bridge] real RunQueue + 3 real task contexts initialized (task_c will really exit)
+[PASS] SchedulerBoot: real RunQueue initialized
+[PASS] Sanctum: real vault created, entered, and region-isolated
+[PASS] SanctumBoot phase
 [task_c] really exiting after 5 real iterations
 [task_d] really spawned at runtime, first real context switch resumed me
-[task_b] real context switch resumed me, iteration 20
 [task_a] real context switch resumed me, iteration 20
-[task_b] real context switch resumed me, iteration 40
+[task_b] real context switch resumed me, iteration 20
 [task_a] real context switch resumed me, iteration 40
+[task_b] real context switch resumed me, iteration 40
 ... (task_a/task_b keep alternating — real interleaving from real,
      hardware-timer-driven context switches, not a hardcoded print order —
      through iteration 200 each; note exactly *where* this interleaving,
      and where the SchedulerBoot/Sanctum/Ipc PASS lines below land
      relative to it, genuinely varies run to run — this specific run put
-     all of them after task_a/task_b's activity, an earlier run
-     interspersed them — because the first real switch away from
-     kernel_main's own flow happens whenever a timer tick first lands
-     after scheduler_bridge::init(), which is real interrupt timing, not
-     a fixed point in the code)
-[PASS] SchedulerBoot: real RunQueue initialized
-[PASS] Sanctum: real vault created, entered, and region-isolated
-[PASS] SanctumBoot phase
+     Sanctum's PASS lines *before* task_a/task_b's activity and Ipc's
+     *after*; a different run has put all of them before, or all after —
+     because the first real switch away from kernel_main's own flow
+     happens whenever a timer tick first lands after
+     scheduler_bridge::init(), which is real interrupt timing, not a
+     fixed point in the code)
 [PASS] Ipc: real capability-checked send/receive round-trip
 [PASS] IpcBoot phase
 [boot] BootSequencer ordering invariant holds: true
 [boot] SyscallBoot: a real int 0x80 entry point now exists (see the Syscall check above) — BootSequencer's SyscallBoot phase itself is still not completed, since there is no general syscall ABI or process model behind it yet
 [PASS] Scheduler: real context switches actually ran both kernel tasks, driven by the real hardware timer
 [PASS] TaskExit: a real dynamically spawned task ran, then really exited and left the real RunQueue
-[PASS] TaskReuse: a task spawned live at runtime ran, really reusing (and really freeing) an exited task's stack
+[PASS] TaskReuse: a task spawned live at runtime ran, really reusing the exact same guard-page-protected stack slot an exited task used
 
 === UOSC boot self-test: 17/17 checks passed ===
 ```
@@ -95,18 +99,24 @@ QEMU's process exit code: `33`, which decodes (per `isa-debug-exit`'s
 `(value << 1) | 1` convention) to `ExitCode::Success = 0x10` — a real,
 scriptable pass signal, not a human reading a terminal.
 
-**Reproduced across well over 150 independent BIOS/UEFI runs total across
+**Reproduced across well over 200 independent BIOS/UEFI runs total across
 this crate's history**, most recently: 31 consecutive runs verifying NX/
 SMEP/SMAP, then a batch verifying page unmapping + task creation/exit
-that caught two real, separate, fixed intermittent bugs (see "Real task
-creation and exit" below), then **66 further consecutive runs with zero
-failures** (40 on QEMU's default CPU model, 10 with `-cpu
+that caught two real, separate, fixed intermittent bugs, then 66 further
+consecutive runs after those fixes (heap-allocated stacks, at the time),
+then this pass's guard-page-protected-stack rewrite, which itself caught
+a real, 100%-reproducible bug on its very first boot (a non-canonical
+region base address — see "Real guard-page-protected task stacks"
+below) and, once fixed, **51 further consecutive runs with zero
+failures** (25 on QEMU's default CPU model, 10 with `-cpu
 qemu64,+smep,+smap` forcing both on, 1 independent UEFI run, 15 more on a
-from-scratch clean rebuild) after the last of those fixes. This many
-repeats weren't idle paranoia — three real, separate, intermittent bugs
-were caught and fixed exactly because of this volume of testing; see
-"Real task creation and exit" below for all three, including one that is
-honestly documented as *mitigated, not debugger-confirmed root-caused*.
+from-scratch clean rebuild). This many repeats weren't idle paranoia —
+real bugs were caught and fixed exactly because of this volume of
+testing at every stage; see "Real task creation and exit" and "Real
+guard-page-protected task stacks" below for the full list, including one
+older finding that remains honestly documented as *mitigated, not
+debugger-confirmed root-caused* even after this pass's stronger,
+structural fix (see that section for exactly what is and isn't proven).
 
 ## What actually happens at boot, and what code runs it
 
@@ -464,13 +474,10 @@ self-test's `TaskExit` check confirms both halves — `task_c` actually ran
 A second demo task, `task_d`, is spawned *live* — not at boot, but from
 inside `task_a`'s own running loop, the first time it observes
 `task_c` has exited. Since `task_c`'s freed slot is the first free one a
-linear scan finds, this reliably exercises real slot reuse: `TaskSlot::
-_stack` holds a `TaskStack` wrapper whose `Drop` impl increments a real
-counter, and `spawn_task` reusing a slot overwrites `_stack` with a plain
-field assignment — ordinary Rust semantics drop the old value first. The
-`TaskReuse` check confirms `task_d` really ran *and* that counter is
-really nonzero — proof a freed slot's old stack is genuinely deallocated
-on reuse, not merely argued to be safe in a doc comment.
+linear scan finds, this reliably exercises real slot reuse. The
+`TaskReuse` check confirms `task_d` really ran *and* landed in the exact
+same guarded `task_stack` slot index `task_c` used — see "Real
+guard-page-protected task stacks" below for what backs this now.
 
 **Three real bugs found and fixed empirically across two passes, not just
 by inspection or code review** — the actual reason the run counts above
@@ -513,7 +520,7 @@ are in the dozens, not a token 3:
    printed anything, and `TaskReuse` failed outright (exit code 35, not a
    hang). Fixed the same way: the whole check-and-spawn decision moved
    inside one `without_interrupts` critical section.
-3. **(This pass, found but not debugger-confirmed — said plainly.)** A
+3. **(Previous pass, found but not debugger-confirmed — said plainly.)** A
    genuinely rare, total hang (no crash, no panic, just silence forever)
    surfaced in a large repeated-boot batch, always immediately after
    `task_c`'s very first `exit_current_task` call. Fine-grained diagnostic
@@ -528,12 +535,13 @@ are in the dozens, not a token 3:
    Quadrupling `STACK_SIZE` to 64 KiB made the hang stop reproducing
    across **66 further consecutive runs** (40 default-CPU, 10 with
    `+smep,+smap` forced on, 1 UEFI, 15 more on a from-scratch clean
-   rebuild) where it had appeared roughly every 25-40 runs before. That is
-   real, substantial evidence the mitigation works — it is deliberately
-   *not* described as a debugger-confirmed root cause, because it isn't
-   one. A real guard-page-protected task stack (the same unmapped-page
-   technique the demand-page region above already demonstrates) would
-   close this properly and is real, separate follow-on work.
+   rebuild) where it had appeared roughly every 25-40 runs before. That was
+   real, substantial evidence the mitigation worked — deliberately *not*
+   described at the time as a debugger-confirmed root cause, because it
+   wasn't one. **This pass replaces that mitigation with real
+   guard-page-protected task stacks** — see the dedicated section below,
+   including a real bug found deploying it and a real, manually-verified
+   fault demonstration.
 
 **Scope, stated plainly**: the task pool is fixed-size, not unbounded. An
 exited task's stack is genuinely freed, but only lazily, the moment a
@@ -542,6 +550,100 @@ never reused (if fewer than `MAX_TASKS` tasks ever exist across a whole
 run) leaks its last occupant's stack for the life of the kernel. No task
 hierarchy (parent/child, wait/reap), no blocking/IO-driven rescheduling,
 no SMP.
+
+## Real guard-page-protected task stacks
+
+`task_stack.rs` is new this pass. Task stacks are no longer
+`Box<[u8]>`-backed heap allocations — each of the `MAX_TASKS` task-pool
+slots now owns a dedicated, fixed virtual address range, mapped through
+the same real `OffsetPageTable`/`PhysicalAllocator` everything else in
+this kernel shares, with a genuinely **unmapped** page directly beneath
+every stack. The mapping is lazy (first use of a slot maps it) and then
+permanent — the slot's real physical frames are reused, not
+freed-and-remapped, the next time that slot index is claimed, since the
+task pool was always a fixed-size resource anyway.
+
+**A real bug, caught on the very first boot with this code**: the first
+choice of base address for this region, `0x_8888_8888_0000`, is not a
+canonical x86-64 address — bits 63:47 must all match (a sign extension of
+bit 47), and a leading `0x8` nibble sets bit 47 while leaving bits 63:48
+at zero. The very first `spawn_task` call to map a guarded stack hit a
+real, immediate panic straight from the `x86_64` crate's own `VirtAddr::
+new`:
+```
+[PANIC] panicked at ...\x86_64-0.15.5\src\addr.rs:81:23:
+virtual address must be sign extended in bits 48 to 64
+```
+Every other fixed region this kernel uses (`0x4444...` for the heap,
+`0x5555...` for the demand-page region, `0x6666.../0x7777...` for the
+ring-3 demo) already uses a nibble `<= 0x7` for exactly this reason — this
+one just hadn't been checked against it before the first real boot did.
+Fixed by moving the region to `0x_3333_3333_0000`.
+
+**The `TaskReuse` self-test now proves something stronger and more
+direct than before.** The old `Box`-backed version proved reuse via a
+`Drop`-counting wrapper (did *some* stack get freed). This version tracks
+the actual array/slot index each task occupies: `task_c`'s exit records
+which slot it vacated, `task_a`'s live `spawn_task(task_d_entry)` call
+records which slot `task_d` landed in, and the check confirms they're the
+exact same index — real, address-level proof of reuse, not an indirect
+counter. Observed directly in the boot log:
+```
+[task_stack] slot 0: mapped a real 64 KiB guarded stack at 0x333333331000, real unmapped guard page at 0x333333330000
+[task_stack] slot 1: mapped a real 64 KiB guarded stack at 0x333333342000, real unmapped guard page at 0x333333341000
+[task_stack] slot 2: mapped a real 64 KiB guarded stack at 0x333333353000, real unmapped guard page at 0x333333352000
+[scheduler_bridge] real RunQueue + 3 real task contexts initialized (task_c will really exit)
+[task_c] really exiting after 5 real iterations
+[task_d] really spawned at runtime, first real context switch resumed me
+```
+— only three slots are ever mapped (task_a/b/c at boot); `task_d` reuses
+slot 2 (task_c's), never triggering a fourth `[task_stack] slot 3: mapped
+...` line, which would have meant reuse hadn't actually happened.
+
+**Manually verified the guard page actually works, the same way the SMAP
+fix was verified**: temporarily made `task_d_entry` recurse (a
+`#[inline(never)]` function pushing a 512-byte buffer each call, `black_
+box`ed to defeat tail-call/inlining optimization) past its real 64 KiB
+budget, rebuilt, and booted. **The real result was a `DOUBLE FAULT`, not a
+plain `PAGE FAULT`** — genuinely informative, and not what was originally
+guessed:
+```
+[task_c] really exiting after 5 real iterations
+[task_d] TEMP: deliberately overflowing this task's guarded stack
+
+[PANIC] panicked at src\interrupts.rs:76:5:
+EXCEPTION: DOUBLE FAULT
+InterruptStackFrame {
+    instruction_pointer: VirtAddr(0x100000096c7),
+    ...
+    stack_pointer: VirtAddr(0x333333352ea0),
+    ...
+}
+```
+Once the stack pointer wanders into the unmapped guard page, the CPU's own
+attempt to push the `#PAGE FAULT` exception frame onto that same,
+already-faulting stack pointer faults *again*, which escalates to a real
+double fault — the exact reason `gdt.rs` already routes the double-fault
+handler through a dedicated IST stack (`DOUBLE_FAULT_IST_INDEX`) rather
+than trusting whatever stack was active when the fault happened: an
+overflowing task's stack can't be assumed to have room for even one more
+exception frame. The captured `stack_pointer` (`0x333333352ea0`) falls
+inside that slot's guard page range (`0x333333352000..0x333333353000`,
+below its real mapped stack at `0x333333353000`) — direct, real evidence
+the overflow reached the guard page specifically. The temporary recursion
+was then fully reverted and the kernel rebuilt back to a clean, 0-warning
+state before any further validation.
+
+**What this closes, and what it still doesn't prove.** This structurally
+closes the "silent corruption" failure mode the previous mitigation could
+only make rare: any real stack overflow across this whole kernel now
+reliably produces a diagnosable panic (a page fault escalating to a
+double fault) instead of possibly corrupting adjacent memory silently.
+It does **not** retroactively prove that stack overflow was the previous
+hang's actual mechanism — no debugger was available to confirm that then,
+and none is available now either; that specific historical question
+remains open. What's real is that the failure mode the hypothesis pointed
+at is now architecturally closed off, not merely made statistically rare.
 
 ## The GDT/segment-register bug (from the context-switching pass)
 
@@ -564,13 +666,14 @@ hardware.
 ## What this deliberately does not claim
 
 - **The context switch and task model are real but narrow.** Real task
-  creation, real task exit, and real (lazy, reuse-triggered) stack
-  reclamation now exist (see "Real task creation and exit" above), but
-  only within a fixed-size pool (`MAX_TASKS = 8`); a slot that's never
-  reused leaks its last occupant's stack for the kernel's lifetime; task
-  stacks have no guard page (a rare real hang traced to this, mitigated
-  by a larger stack size but not debugger-root-caused — see above); there
-  is still no blocking/IO-driven rescheduling (a task can only ever yield
+  creation, real task exit, and real, guard-page-protected stacks now
+  exist (see "Real task creation and exit" and "Real
+  guard-page-protected task stacks" above), but only within a fixed-size
+  pool (`MAX_TASKS = 8`, one-to-one with `task_stack::MAX_SLOTS`); a
+  slot's real pages, once mapped, stay mapped and reused for the
+  kernel's lifetime rather than being unmapped between occupants (an
+  intentional simplification, not a leak — see that section); there is
+  still no blocking/IO-driven rescheduling (a task can only ever yield
   by being timer-preempted), no task hierarchy (parent/child, wait/reap),
   and no SMP (the switch code's soundness argument in `context.rs`/
   `scheduler_bridge.rs` explicitly leans on "single core, only ever

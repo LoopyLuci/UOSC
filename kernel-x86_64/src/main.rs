@@ -19,7 +19,9 @@
 //! creation and real task exit (`context.rs` + `scheduler_bridge.rs`
 //! genuinely save/restore independently-running kernel tasks' stack
 //! pointers and callee-saved registers, driven by the real hardware
-//! timer, within a fixed-size task pool), real hardware page tables
+//! timer, within a fixed-size task pool), each task backed by a real,
+//! guard-page-protected stack (`task_stack.rs`) rather than a bare heap
+//! allocation, real hardware page tables
 //! (`paging.rs`): a real `OffsetPageTable` over the CPU's actual CR3, a
 //! kernel heap that's really mapped page-by-page instead of static BSS
 //! (`allocator.rs`), a real page fault deliberately triggered and
@@ -51,6 +53,7 @@ mod qemu_exit;
 mod scheduler_bridge;
 mod serial;
 mod syscall;
+mod task_stack;
 
 use bootloader_api::{BootInfo, entry_point};
 use bootloader_api::config::{BootloaderConfig, Mapping};
@@ -383,8 +386,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         scheduler_bridge::task_c_really_exited(),
     );
     results.record(
-        "TaskReuse: a task spawned live at runtime ran, really reusing (and really freeing) an exited task's stack",
-        scheduler_bridge::task_reuse_freed_a_stack(),
+        "TaskReuse: a task spawned live at runtime ran, really reusing the exact same guard-page-protected \
+         stack slot an exited task used",
+        scheduler_bridge::task_reused_a_guarded_slot(),
     );
 
     serial_println!("\n=== UOSC boot self-test: {}/{} checks passed ===", results.passed, results.total);
