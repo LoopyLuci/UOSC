@@ -233,12 +233,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // --- Real ring-3 → ring-0 privilege transition, deliberately run
     // before scheduler_bridge::init() below — see syscall.rs's module
     // docs for why real preemption and this demo don't overlap in this
-    // pass. A real hand-assembled program runs at CPL3, traps via a real
-    // int 0x80, and the real handler observes the exact value (42) it put
-    // in rax right before trapping. ---
-    let syscall_ok = syscall::run_demo_syscall() == Some(42);
+    // pass. A real hand-assembled program runs at CPL3, makes three real
+    // syscalls (really resumed in ring 3 after each one via a real
+    // iretq), then a fourth "exit" syscall that really abandons ring 3
+    // for good. Passing requires all three ordinary values to have been
+    // observed, in order — proof the round trip genuinely repeated, not
+    // just that one trap fired. ---
+    let syscall_ok = syscall::run_demo_syscall() == Some([10, 20, 30]);
     results.record(
-        "Syscall: real CPL3 code trapped into the kernel via int 0x80, observed by the real handler",
+        "Syscall: real CPL3 code made 3 real round-trip syscalls + 1 real exit trap via int 0x80",
         syscall_ok,
     );
 

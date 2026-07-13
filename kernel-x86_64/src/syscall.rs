@@ -1,16 +1,22 @@
 //! A real ring-3 → ring-0 privilege transition: actual user-mode (CPL3)
 //! code, on real hardware, trapping into the kernel via `int 0x80` and
 //! being observed by a real handler — not a simulation of a syscall, and
-//! not CPL0 code merely pretending to be "userspace."
+//! not CPL0 code merely pretending to be "userspace." This pass extends
+//! the original one-shot demo to a real round trip: the ring-3 program
+//! makes three real syscalls, is really resumed in ring 3 after each one,
+//! and only abandons ring 3 on a fourth, distinct "exit" trap.
 //!
 //! **Scope, stated plainly**: this is a single, fixed, hand-assembled
-//! ring-3 program (no ELF loader, no process abstraction, no return to
-//! ring 3 after the syscall — see below), deliberately run *before*
-//! `scheduler_bridge::init()` so it never overlaps with real task
-//! switching. Combining a real privilege-level transition with real
-//! preemptive switching (a timer tick landing mid-ring-3, deciding to
-//! switch tasks, while running on the syscall entry's dedicated RSP0
-//! stack) is real, additional complexity not attempted in this pass.
+//! ring-3 program (no ELF loader, no process abstraction, no general
+//! syscall ABI), deliberately run *before* `scheduler_bridge::init()` so
+//! it never overlaps with real task switching. Combining a real
+//! privilege-level transition with real preemptive switching (a timer
+//! tick landing mid-ring-3, deciding to switch tasks, while running on
+//! the syscall entry's dedicated RSP0 stack) is real, additional
+//! complexity not attempted in this pass. Also still not attempted:
+//! SMEP/SMAP (the kernel can freely read/write/execute the "user" pages),
+//! NX enforcement (those pages are writable *and* executable), and more
+//! than one ring-3 program ever existing at once.
 //!
 //! ## The mechanism
 //!
@@ -20,37 +26,37 @@
 //! frame (`SS`/`RSP`/`RFLAGS`/`CS`/`RIP`, all ring-3 selectors/values) and
 //! executes `iretq` to actually drop the CPU to CPL3 for the first time.
 //!
-//! The ring-3 program itself is nine hand-assembled bytes
-//! (`USER_PROGRAM`): `mov eax, 42; int 0x80; jmp $`. Hand-assembled,
-//! rather than a compiled Rust function copied by address, so its exact
-//! length is known with certainty when copying it into a freshly mapped
+//! The ring-3 program itself is hand-assembled bytes (`USER_PROGRAM`), not
+//! a compiled Rust function copied by address, so its exact length is
+//! known with certainty when copying it into a freshly mapped
 //! user-accessible page — no guessing where a compiled function's
 //! boundary falls, and no risk of position-dependent relocations breaking
-//! when the bytes move to a new address.
+//! when the bytes move to a new address. It makes four real traps in
+//! sequence: `mov eax,10; int 0x80`, `mov eax,20; int 0x80`,
+//! `mov eax,30; int 0x80`, then `mov eax,999; int 0x80` (999 =
+//! [`EXIT_SYSCALL`]), followed by a defensive `jmp $` that's only ever
+//! reached if the exit handling below has a bug.
 //!
 //! `int 0x80`, with the IDT entry's DPL set to ring 3
 //! (`interrupts.rs`), traps into [`syscall_entry_stub`] — also naked,
 //! since reading the "syscall number" out of `rax` at the moment of the
 //! trap needs the real register file, which the typed
-//! `extern "x86-interrupt"` handler convention doesn't expose. Critically,
-//! this stub **never `iretq`s back to ring 3** — since nothing here
-//! implements process exit or multiple syscalls, there's nothing useful
-//! for the ring-3 program to do after the one trap. Instead, exactly like
-//! `scheduler_bridge.rs`'s `BOOT_PID` handback, it loads the kernel
-//! stack pointer [`enter_ring3`] saved and `ret`s straight back into
-//! `run_demo_syscall`'s caller — abandoning the ring-3 context (whose
-//! `jmp $` after the trap is consequently never actually reached) rather
-//! than resuming it.
+//! `extern "x86-interrupt"` handler convention doesn't expose.
 //!
-//! **What this deliberately does not claim**: no SMEP/SMAP (the kernel
-//! can freely read/write/execute the "user" pages back), no NX
-//! enforcement (the user pages are mapped writable *and* executable, not
-//! least-privilege), no return path to ring 3, no second syscall, no
-//! process/exit semantics — one hand-written program, one trap, one
-//! observed result.
+//! **Two different real returns, not one**: for the three ordinary
+//! syscalls, the stub does the standard, textbook thing — record the
+//! value, then `iretq` using the *same* hardware-pushed interrupt frame
+//! the trap already left on the stack, resuming ring 3 at the very next
+//! instruction after `int 0x80`. Nothing needs to be reconstructed;
+//! that's the whole point of `iretq`. Only the fourth, `EXIT_SYSCALL`
+//! trap takes the other path — exactly like `scheduler_bridge.rs`'s
+//! `BOOT_PID` handback, it loads the kernel stack pointer [`enter_ring3`]
+//! saved and `ret`s straight back into `run_demo_syscall`'s caller,
+//! abandoning ring 3 for good (the trailing `jmp $` is consequently never
+//! actually reached).
 
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
@@ -60,13 +66,30 @@ pub const USER_CODE_ADDR: u64 = 0x_6666_6666_0000;
 pub const USER_STACK_ADDR: u64 = 0x_7777_7777_0000;
 const USER_STACK_SIZE: u64 = 4096;
 
-/// `mov eax, 42` (B8 2A 00 00 00) ; `int 0x80` (CD 80) ; `jmp $` (EB FE).
-/// The `jmp $` is a defensive landing spot only — see the module docs for
-/// why the syscall handler never actually returns control here.
-const USER_PROGRAM: [u8; 9] = [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xEB, 0xFE];
+/// The one syscall number that means "abandon ring 3 for good," distinct
+/// from any of the three ordinary demo values (10/20/30) below.
+const EXIT_SYSCALL: u64 = 999;
+
+/// Four `mov eax, imm32` (B8 + 4-byte LE immediate) / `int 0x80` (CD 80)
+/// pairs — three ordinary syscalls (10, 20, 30), then the exit syscall
+/// (999 = 0x000003E7) — followed by a defensive `jmp $` (EB FE), never
+/// actually reached if exit handling works.
+const USER_PROGRAM: [u8; 30] = [
+    0xB8, 0x0A, 0x00, 0x00, 0x00, 0xCD, 0x80, // mov eax, 10  ; int 0x80
+    0xB8, 0x14, 0x00, 0x00, 0x00, 0xCD, 0x80, // mov eax, 20  ; int 0x80
+    0xB8, 0x1E, 0x00, 0x00, 0x00, 0xCD, 0x80, // mov eax, 30  ; int 0x80
+    0xB8, 0xE7, 0x03, 0x00, 0x00, 0xCD, 0x80, // mov eax, 999 ; int 0x80
+    0xEB, 0xFE, // jmp $  (defensive; never reached)
+];
 
 static mut KERNEL_RETURN_RSP: u64 = 0;
-static LAST_SYSCALL: AtomicU64 = AtomicU64::new(0);
+
+/// The three ordinary syscall values actually observed, in trap order —
+/// read back by the boot self-test to confirm the real round trip really
+/// happened (ring 3 really resumed and really made each subsequent trap),
+/// not just that one syscall fired.
+static OBSERVED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static OBSERVED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Drops the CPU to CPL3 for the first time, saving the current (kernel)
 /// execution context first so [`syscall_entry_stub`] can later abandon
@@ -101,24 +124,35 @@ unsafe extern "C" fn enter_ring3(user_code: u64, user_stack_top: u64, user_cs: u
 
 /// The raw IDT handler for vector `0x80`, installed directly by address
 /// (`interrupts.rs`, since reading `rax` needs the real register file, not
-/// the typed `extern "x86-interrupt"` frame). Reads the trapped `rax`,
-/// records it, then abandons ring 3 by resuming the kernel context
-/// [`enter_ring3`] saved — see the module docs for why.
+/// the typed `extern "x86-interrupt"` frame). Branches on the trapped
+/// `rax` *before* calling into Rust, since `record_syscall` (a normal
+/// `extern "C"` function) is free to clobber `rax` as scratch — relying on
+/// it surviving the call would be a real bug waiting to happen, not a
+/// hypothetical one.
 ///
-/// **A second real bug found here**: the IDT entry is (by
+/// **A second real bug found building the original one-shot version of
+/// this** (still relevant to the exit path below): the IDT entry is (by
 /// `set_handler_addr`'s own documented default) an *interrupt* gate,
 /// which clears `IF` automatically on entry — normally undone by the
-/// `iretq` a typed handler ends with, which restores the saved `RFLAGS`.
-/// This stub deliberately never `iretq`s (see above), so without the
-/// explicit `sti` below, `IF` stayed cleared *permanently* after the demo
-/// — no crash, just every later timer tick silently not firing, and
-/// `hlt()` (which only wakes on NMI when `IF=0`) hanging forever the
-/// first time `main.rs` reached its `hlt()` loop. Real, reproduced,
-/// fixed: interrupts must be explicitly re-enabled before resuming a
-/// context that expects them on.
+/// `iretq` the *continue* path below already performs. The *exit* path
+/// deliberately never `iretq`s, so it still needs the same explicit `sti`
+/// the original fix added — otherwise `IF` stays cleared permanently the
+/// instant the demo actually exits, and every later timer tick silently
+/// stops firing.
 #[unsafe(naked)]
 pub unsafe extern "C" fn syscall_entry_stub() {
     naked_asm!(
+        "cmp eax, {exit}",
+        "je 3f",
+        // --- Continue path: record, then iretq using the interrupt
+        // frame the trap already pushed — no reconstruction needed,
+        // this is exactly what a normal interrupt return does. ---
+        "mov rdi, rax",
+        "call {handler}",
+        "iretq",
+        // --- Exit path: record, then abandon ring 3 and resume the
+        // kernel context enter_ring3 saved. ---
+        "3:",
         "mov rdi, rax",
         "call {handler}",
         "lea rax, [rip + {kernel_rsp}]",
@@ -131,23 +165,32 @@ pub unsafe extern "C" fn syscall_entry_stub() {
         "pop rbp",
         "sti",
         "ret",
+        exit = const EXIT_SYSCALL,
         handler = sym record_syscall,
         kernel_rsp = sym KERNEL_RETURN_RSP,
     )
 }
 
 extern "C" fn record_syscall(number: u64) {
-    LAST_SYSCALL.store(number, Ordering::SeqCst);
-    serial_println!("[syscall] real int 0x80 trap from ring 3, rax={number}");
+    if number == EXIT_SYSCALL {
+        serial_println!("[syscall] real int 0x80 EXIT trap from ring 3 — abandoning ring 3 for good");
+        return;
+    }
+    let idx = OBSERVED_COUNT.fetch_add(1, Ordering::SeqCst);
+    if idx < OBSERVED.len() {
+        OBSERVED[idx].store(number, Ordering::SeqCst);
+    }
+    serial_println!("[syscall] real int 0x80 trap from ring 3, rax={number} — returning to ring 3");
 }
 
 /// Maps a real user-accessible code page and stack page, copies the real
 /// hand-assembled ring-3 program into the code page, and actually drops
-/// to CPL3 to run it. Returns the value the real syscall handler observed
-/// in `rax` at the trap, once the ring-3 context has been abandoned and
-/// this kernel context resumed — `None` if the pages couldn't be mapped
-/// (paging not yet initialized).
-pub fn run_demo_syscall() -> Option<u64> {
+/// to CPL3 to run it. The ring-3 program makes three ordinary syscalls
+/// (really resumed in ring 3 after each) and one exit syscall (which
+/// really abandons ring 3). Returns the three ordinary values observed,
+/// in trap order, once the exit syscall has resumed this kernel context —
+/// `None` if the pages couldn't be mapped (paging not yet initialized).
+pub fn run_demo_syscall() -> Option<[u64; 3]> {
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
     crate::paging::with_mapper_and_phys(|mapper, phys| {
@@ -172,5 +215,9 @@ pub fn run_demo_syscall() -> Option<u64> {
         enter_ring3(USER_CODE_ADDR, user_stack_top, user_cs, user_ss);
     }
 
-    Some(LAST_SYSCALL.load(Ordering::SeqCst))
+    Some([
+        OBSERVED[0].load(Ordering::SeqCst),
+        OBSERVED[1].load(Ordering::SeqCst),
+        OBSERVED[2].load(Ordering::SeqCst),
+    ])
 }

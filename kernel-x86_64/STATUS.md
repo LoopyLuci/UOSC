@@ -50,27 +50,32 @@ UOSC x86-64 — real boot starting
 [PASS] Paging: real kernel heap, mapped through real hardware page tables, holds real data
 [page_fault] real #PF at 0x555555550000, demand-paged and resumed
 [PASS] PageFault: a real #PF was triggered and demand-paged by the real handler, then resumed
-[syscall] real int 0x80 trap from ring 3, rax=42
-[PASS] Syscall: real CPL3 code trapped into the kernel via int 0x80, observed by the real handler
+[syscall] real int 0x80 trap from ring 3, rax=10 — returning to ring 3
+[syscall] real int 0x80 trap from ring 3, rax=20 — returning to ring 3
+[syscall] real int 0x80 trap from ring 3, rax=30 — returning to ring 3
+[syscall] real int 0x80 EXIT trap from ring 3 — abandoning ring 3 for good
+[PASS] Syscall: real CPL3 code made 3 real round-trip syscalls + 1 real exit trap via int 0x80
 [PASS] Capability: real CapabilityBroker grants the issuer and denies a stranger
 [scheduler_bridge] real RunQueue + 2 real task contexts initialized
 [PASS] SchedulerBoot: real RunQueue initialized
+[PASS] Sanctum: real vault created, entered, and region-isolated
+[PASS] SanctumBoot phase
+[PASS] Ipc: real capability-checked send/receive round-trip
+[PASS] IpcBoot phase
+[boot] BootSequencer ordering invariant holds: true
 [task_a] real context switch resumed me, iteration 20
 [task_b] real context switch resumed me, iteration 20
 [task_a] real context switch resumed me, iteration 40
 [task_b] real context switch resumed me, iteration 40
 ... (task_a/task_b keep alternating — real interleaving from real,
      hardware-timer-driven context switches, not a hardcoded print order —
-     through iteration 200 each; note this interleaving actually falls
-     *between* SchedulerBoot and Sanctum below — the first real switch
-     away from kernel_main's own flow happens the moment a timer tick
-     lands after scheduler_bridge::init(), which in this run was already
-     mid-way through the self-test, not at the later hlt() loop)
-[PASS] Sanctum: real vault created, entered, and region-isolated
-[PASS] SanctumBoot phase
-[PASS] Ipc: real capability-checked send/receive round-trip
-[PASS] IpcBoot phase
-[boot] BootSequencer ordering invariant holds: true
+     through iteration 200 each; note exactly *where* this interleaving
+     falls in the log genuinely varies run to run — this specific run put
+     it between the BootSequencer line and SyscallBoot below, an earlier
+     run put it between SchedulerBoot and Sanctum — because the first
+     real switch away from kernel_main's own flow happens whenever a
+     timer tick first lands after scheduler_bridge::init(), which is real
+     interrupt timing, not a fixed point in the code)
 [boot] SyscallBoot: a real int 0x80 entry point now exists (see the Syscall check above) — BootSequencer's SyscallBoot phase itself is still not completed, since there is no general syscall ABI or process model behind it yet
 [PASS] Scheduler: real context switches actually ran both kernel tasks, driven by the real hardware timer
 
@@ -207,10 +212,10 @@ difference between "wasteful" and "fails." Full writeup and fix in
 
 `syscall.rs` is new this pass: a real ring-3 (CPL3) → ring-0 privilege
 transition, not CPL0 code merely pretending to be "userspace." A real
-hand-assembled 9-byte program (`mov eax, 42; int 0x80; jmp $`) runs at
-CPL3 on real hardware, traps into the kernel via a real `int 0x80`, and
-the real handler observes the exact value it put in `rax`. Full mechanism
-in `syscall.rs`'s module docs; short version:
+hand-assembled program runs at CPL3 on real hardware, makes **three real
+round-trip syscalls plus one real exit syscall**, and the real handler
+observes each value in order. Full mechanism in `syscall.rs`'s module
+docs; short version:
 
 - `enter_ring3` (naked `asm!`) saves the kernel's stack pointer and
   callee-saved registers — the same convention as
@@ -221,19 +226,31 @@ in `syscall.rs`'s module docs; short version:
   function's address — its exact length has to be known with certainty
   when copying it into a freshly mapped, real, user-accessible page, and
   hand-assembling avoids any risk of position-dependent relocations
-  breaking when the bytes move to a new address.
+  breaking when the bytes move to a new address. It makes four real
+  traps in sequence: `mov eax,10/20/30; int 0x80` three times, then
+  `mov eax,999; int 0x80` (the exit syscall).
 - `int 0x80` traps into `syscall_entry_stub`, installed by raw address
   (`Entry::set_handler_addr`, not the typed `extern "x86-interrupt"`
   convention, since reading `rax` at the trap needs the real register
   file) with DPL set to `Ring3` so a real `int 0x80` from CPL3 doesn't
   raise a real `#GP` first.
-- The stub deliberately never `iretq`s back to ring 3 — there's no
-  process/exit model to make a second syscall meaningful — instead it
-  abandons the ring-3 context and resumes the saved kernel context
-  directly, exactly like `scheduler_bridge.rs`'s `BOOT_PID` handback.
+- **Two genuinely different real returns**, not one: for the three
+  ordinary syscalls, the stub does the textbook thing — record the
+  value, then `iretq` using the *same* hardware-pushed interrupt frame
+  the trap already left on the stack, resuming ring 3 at the very next
+  instruction after `int 0x80`. Nothing is reconstructed; that's what
+  `iretq` is for. Only the exit syscall abandons ring 3 — exactly like
+  `scheduler_bridge.rs`'s `BOOT_PID` handback, loading the kernel stack
+  pointer `enter_ring3` saved and `ret`ing straight back into
+  `run_demo_syscall`'s caller.
+- The branch between those two paths happens *before* calling into Rust,
+  comparing the trapped `rax` directly — `record_syscall` is a normal
+  `extern "C"` function, free to clobber `rax` as scratch, so relying on
+  it surviving the call would have been a real bug waiting to happen.
 
-**Two real bugs found getting this to actually work**, on top of the
-`seed_free_lists` bug above:
+**Two real bugs found building the original one-shot version**, on top of
+the `seed_free_lists` bug above, plus one near-miss avoided while
+extending it to a real round trip:
 
 1. A real link failure: `sym KERNEL_RETURN_RSP` used as `lea rax,
    [{kernel_rsp}]` produced `relocation R_X86_64_32S cannot be used
@@ -244,15 +261,27 @@ in `syscall.rs`'s module docs; short version:
 2. **A real, reproducible hang**, found only after the link fix: the
    `int 0x80` IDT entry is (by `set_handler_addr`'s own documented
    default) an *interrupt* gate, which clears `IF` on entry — normally
-   undone by the `iretq` a typed handler ends with. `syscall_entry_stub`
-   deliberately never `iretq`s (see above), so without an explicit `sti`,
-   `IF` stayed cleared *permanently* after the syscall demo returned —
-   every later timer tick silently stopped firing, and `main.rs`'s
-   `hlt()` loop (which only wakes on NMI when `IF=0`) hung forever the
-   first time it ran. No crash, no panic — just a real, silent, total
-   loss of interrupts, caught by noticing the self-test never finished
-   rather than by any error message. Fixed by an explicit `sti` before
-   the final `ret`.
+   undone by the `iretq` a typed handler ends with. The original one-shot
+   stub deliberately never `iretq`d, so without an explicit `sti`, `IF`
+   stayed cleared *permanently* after the syscall demo returned — every
+   later timer tick silently stopped firing, and `main.rs`'s `hlt()` loop
+   (which only wakes on NMI when `IF=0`) hung forever the first time it
+   ran. No crash, no panic — just a real, silent, total loss of
+   interrupts, caught by noticing the self-test never finished rather
+   than by any error message. Fixed by an explicit `sti` before the
+   final `ret` on the exit path — the *continue* path added this pass
+   doesn't need it, since its `iretq` already restores the saved
+   `RFLAGS` (with `IF=1`) the normal way.
+3. Extending to a round trip could easily have reintroduced bug 2 in a
+   new shape (forgetting that only the *exit* path needs the manual
+   `sti`, since the *continue* path's `iretq` already handles it) — kept
+   out by branching to two clearly separate code paths in
+   `syscall_entry_stub` rather than trying to share one tail between
+   them, and verified directly: all three "returning to ring 3" log
+   lines plus the one "abandoning ring 3" line appear on every run,
+   proving each `iretq` really did resume ring 3 and each subsequent
+   trap really did fire again, not just that the boot self-test happened
+   to finish.
 
 ## UEFI boot
 
@@ -360,10 +389,14 @@ hardware.
   1.25 MiB total, `allocator.rs`'s `BOOTSTRAP_HEAP_SIZE`/`REAL_HEAP_SIZE`)
   — real, page-mapped memory, but a hardcoded ceiling, not something that
   grows on demand past that.
-- **The ring-3 demo is real but narrow.** One hand-assembled program, one
-  trap, no return to ring 3, no second syscall, no process/exit semantics,
+- **The ring-3 demo is real but narrow.** One hand-assembled program, four
+  fixed traps (three real round trips back to ring 3, one real exit) —
+  real, repeated privilege transitions, but still no general syscall ABI
+  (no argument-passing convention beyond "the value happens to be in
+  rax"), no process/exit semantics beyond this one hardcoded exit value,
   no SMEP/SMAP (the kernel can freely read/write/execute the "user"
-  pages), no NX enforcement (those pages are writable *and* executable).
+  pages), no NX enforcement (those pages are writable *and* executable),
+  and only ever one ring-3 program existing at a time.
   `BootSequencer`'s `SyscallBoot` phase itself is still deliberately left
   incomplete — a real trap-and-handle mechanism now exists, but there is
   no general syscall ABI or process model behind it, and the live
