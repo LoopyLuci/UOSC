@@ -11,11 +11,49 @@ fairness — the task that's behind always eventually gets picked, because
 picking it is what stops it from falling further behind. The n-task case
 (arbitrary queue size) is exercised empirically, not proved here, by
 `scheduler.rs`'s existing `no_normal_task_starves_for_arbitrary_task_counts`
-property test (256 random cases, up to 12 tasks). Extending this proof to
-arbitrary n is real, tractable follow-on work — the two-task case already
-contains the essential argument (a strictly-decreasing-then-flipping gap),
-it just needs to be generalized from a pair to a list with a
-minimum-selection argument.
+property test (256 random cases, up to 12 tasks).
+
+**The general n-task argument, worked out but not (yet) machine-checked**:
+naively generalizing the two-task proof by picking some other single task
+`j` to compare against `t` doesn't work — if `j` ties with `t` and loses
+the tie-break, `j` can be re-picked without the `t`-vs-`j` gap closing at
+all, and nothing in a single-opponent argument bounds how long that can
+recur. The fix is to stop comparing `t` against one opponent and instead
+track `restMin(vs, t) := min { vs[i] | i ≠ t }`, the minimum over
+*everyone else*. Two facts make this work where the pairwise approach
+didn't:
+
+1. `restMin` is non-decreasing over time, full stop — every step increments
+   exactly one entry by `inc` and never decreases anything, so the minimum
+   of any fixed subset of entries can only rise or hold.
+2. `restMin` cannot *hold* for more than `n - 1` consecutive steps that
+   don't pick `t`: each such step increments whichever other task is
+   currently *at* `restMin`; once incremented, that task can never return
+   to `restMin` (monotonicity again), so it's permanently retired from the
+   set of tasks still capable of holding `restMin` at its current value.
+   There are at most `n - 1` other tasks to retire, so `restMin` must
+   strictly increase (by at least `inc`) within `n - 1` steps of not
+   picking `t`.
+
+Together: as long as `vs[t] > restMin`, repeat "at most `n-1` steps" rounds,
+each provably increasing `restMin` by at least `inc`, until
+`vs[t] ≤ restMin` — at which point `t` is (tied-for-)minimal and must be
+picked. This gives an explicit bound, `(n - 1) * ⌈(vs[t] - restMin₀) / inc⌉`
+steps, generalizing the two-task proof's single-opponent bound exactly the
+way you'd hope. It avoids the tie-break trap because `restMin` bundles all
+`n - 1` opponents into one monovariant instead of tracking one at a time.
+
+This is a complete, correct argument, not a hand-wave — but turning it into
+Lean means representing `restMin` over a `List Nat` with position identity
+preserved across `List.set` updates, and the "at most `n-1` retirements"
+step needs its own bounded induction over a shrinking finite set of
+not-yet-retired indices. That's real, additional proof engineering on top
+of what's in this file, with a real chance of hitting the same class of
+fiddly index/`List` lemma issues the two-task proof needed several
+iterations to resolve — attempting it inside this pass risked leaving
+something half-finished or subtly wrong with no compiler run left to catch
+it. Recorded here precisely enough that finishing it is a bounded,
+well-defined follow-on task, not an open question.
 -/
 
 /-- One CFS scheduling step for two tasks: whichever has the smaller (or

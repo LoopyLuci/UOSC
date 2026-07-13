@@ -20,7 +20,7 @@ cargo build --lib             → compiles clean under #![no_std] (no warnings)
 cargo test                    → 64 passed; 0 failed
 cargo test --release          → 64 passed; 0 failed (same result under optimization)
 cargo clippy --all-targets -- -W clippy::all   → 0 warnings
-lean Capability.lean / Memory.lean / Scheduler.lean   → all three exit 0 (proofs-lean4/)
+lean Capability.lean / Memory.lean / Scheduler.lean / Boot.lean / PageFault.lean   → all five exit 0 (proofs-lean4/)
 ```
 
 Eight modules now, each a real port of one `.ti` file's portable-logic
@@ -44,7 +44,7 @@ once, in order.
 
 ## Real, mechanically-checked proofs (new this pass)
 
-`../proofs-lean4/` re-hosts 6 of the 10 numbered properties from
+`../proofs-lean4/` re-hosts 8 of the 10 numbered properties from
 `kernel_security.ax` in actual Lean 4 (toolchain: `elan` 4.2.3 /
 `lean` 4.31.0, installed via `scoop install elan`), checked against formal
 models built to mirror what this crate's Rust code actually does:
@@ -53,16 +53,24 @@ models built to mirror what this crate's Rust code actually does:
 - Property 2 (`memory_process_isolation`)
 - Property 3 (`capability_revocation_effective`)
 - Property 5 (`scheduler_no_starvation`) — **two-task case**; see
-  `proofs-lean4/Scheduler.lean`'s header for the honest scope note on why
-  the general n-task case isn't (yet) formally proved
+  `proofs-lean4/Scheduler.lean`'s header for a complete, worked-out — but
+  not yet formalized — argument for the general n-task case
+- Property 7 (`page_fault_handler_correctness`) — **the spec's literal
+  two-way claim is false**; `proofs-lean4/PageFault.lean` proves a
+  concrete counterexample and the real three-way characterization that
+  actually holds
 - Property 8 (`capability_delegation_authentic`) — **permission-bound half
   only**; the signature/PKI half isn't modeled
 - Property 9 (`sanctum_vault_isolation`) — same proof as Property 2, since
   a vault region and a process address space are the same shape of thing
+- Property 10 (`boot_sequence_integrity`) — proved against `boot.rs`'s
+  `BootSequencer`, the first time this theorem has had a real code
+  referent at all (see bug #7)
 
 Full detail, including exactly what's NOT covered and why (Properties 4, 6,
-7, 10, and the excluded halves of 8), is in `../proofs-lean4/README.md` —
-this is not "10/10 done," and that file says so explicitly.
+the n-task half of 5, and the excluded half of 8), is in
+`../proofs-lean4/README.md` — this is not "10/10 done," and that file says
+so explicitly.
 
 ## Real bugs found in the Titan specification while porting it
 
@@ -125,6 +133,16 @@ of these were invisible until now:
    `console::tests::printf_substitutes_integer_arguments_in_order` and
    `console::tests::printf_substitutes_string_argument`.
 
+10. **`kernel_security.ax`'s `theorem page_fault_handler_correctness` is
+    itself wrong**, not just unproven — the only bug in this list found in
+    the *proof* file rather than the `.ti` kernel source. It claims every
+    fault resolves to `Success` or `PermissionDenied`, a two-way split. The
+    real handler (correctly) has a third outcome: a fault outside every
+    registered region is `Unmapped`, no permission decision involved at
+    all. `proofs-lean4/PageFault.lean`'s `theorem_as_stated_is_false` is a
+    machine-checked counterexample (an empty region list), followed by the
+    real three-way characterization that actually holds.
+
 ## What this deliberately does not claim
 
 - **No bootable binary.** This is portable logic — no boot sequence, no
@@ -140,20 +158,17 @@ of these were invisible until now:
   executes `asm!("vmcall")`/`asm!("syscall")`/MSR reads with no
   computation to get right or wrong; the driver files are almost entirely
   MMIO/port I/O. There was nothing portable-logic-shaped to port.
-- **The ten theorems in `proofs/kernel_security.ax` are now 6/10
+- **The ten theorems in `proofs/kernel_security.ax` are now 8/10
   mechanically re-hosted** in `../proofs-lean4/` (Lean 4, no Mathlib,
-  real `lean` compiler runs, not hand-waved). The remaining 4 — full
-  detail in `proofs-lean4/README.md` — are Properties 4, 6, 7, and 10.
-  Properties 4 (`ipc_message_atomicity`) and 6
-  (`interrupt_handler_safety`) need an operational semantics of
-  hardware/concurrency this codebase doesn't model. Property 7
-  (`page_fault_handler_correctness`) is covered empirically by
-  `memory.rs`'s page-fault tests, not formally. Property 10
-  (`boot_sequence_integrity`) now has a real code referent —
-  `boot::BootSequencer` (bug #7 above) — but that referent didn't exist
-  until this pass, so it hasn't been formalized in Lean yet; doing so is
-  straightforward, tractable follow-on work, not a hard blocker like
-  Properties 4 and 6.
+  real `lean` compiler runs, not hand-waved). The remaining 2 — full
+  detail in `proofs-lean4/README.md` — are Properties 4
+  (`ipc_message_atomicity`) and 6 (`interrupt_handler_safety`), both of
+  which need a real operational semantics of hardware/concurrency this
+  codebase doesn't model; `ipc.rs`'s real concurrent-thread test is the
+  empirical evidence this codebase has for Property 4 instead. Property
+  5's n-task case (only the two-task case is formally proved) and
+  Property 8's signature/PKI half are also not covered — see
+  `proofs-lean4/README.md` for exactly why in each case.
 - **Cascading capability revocation is not implemented.** Demonstrated,
   not hidden, by `capability::tests::revoking_source_does_not_touch_an_independently_issued_delegate_token`
   and its Lean mirror, `Capability.lean`'s
@@ -175,11 +190,15 @@ of these were invisible until now:
 The roadmap frames Phase 0 as three things: a real reference
 implementation, real proof-checking, and a real test suite. This pass now
 delivers meaningful coverage of all three — 8 of UOSC's ~11 kernel/driver
-files have a real ported logic subset, 6 of 10 specified theorems have a
-real machine-checked proof, and 64 tests (up from the previous pass's 33)
+files have a real ported logic subset, 8 of 10 specified theorems have a
+real machine-checked result (one of which is a proof that the theorem as
+originally stated is false), and 64 tests (up from the previous pass's 33)
 back all of it. It is still not complete: 3 files have zero portable logic
-to port and are honestly excluded rather than faked, 4 theorems remain
-unformalized with stated reasons, and no hardware bring-up has been
-attempted at all. Extending further — the n-task scheduler proof, an
-interrupt operational semantics, a PKI model for delegation authenticity —
-is real, substantial, separate work.
+to port and are honestly excluded rather than faked, 2 theorems (Properties
+4 and 6) remain unformalized because they need machinery this codebase
+doesn't have, and 2 more are partial (Property 5's n-task case has a
+complete written-out argument but isn't yet machine-checked; Property 8's
+signature/PKI half isn't modeled). No hardware bring-up has been attempted
+at all. Extending further — the n-task scheduler proof, an interrupt
+operational semantics, a PKI model for delegation authenticity — is real,
+substantial, separate work.
