@@ -1,0 +1,28 @@
+[workspace]
+
+[package]
+name = "uosc-kernel-x86_64"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "uosc-kernel-x86_64"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+bootloader_api = "0.11.15"
+lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
+linked_list_allocator = "0.10.6"
+pic8259 = "0.11.0"
+spin = "0.12.1"
+uart_16550 = "0.6.0"
+uosc-core = { path = "../reference-rs" }
+x86_64 = { version = "0.15.5", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
