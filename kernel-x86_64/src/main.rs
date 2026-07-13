@@ -11,20 +11,18 @@
 //! PASS/FAIL for each over the serial console and exiting QEMU with a real,
 //! scriptable exit code.
 //!
-//! **What this does not claim**: no hardware page tables are wired up (CR3
-//! still points at the bootloader's identity/offset mapping — the virtual
-//! side of `uosc_core::memory` remains the in-memory policy model it
-//! already was, not a hardware page-walker, exactly as `reference-rs`'s
-//! `STATUS.md` already said); no userspace, no syscall entry point, no
-//! filesystem, no network. This is a real boot to a real self-test, not a
-//! usable operating system.
+//! **What this does not claim**: no userspace, no syscall entry point, no
+//! filesystem, no network stack, no SMP. This is a real boot to a real
+//! self-test, not a usable operating system.
 //!
-//! It does now include a real context switch: `context.rs` +
+//! It does now include a real context switch (`context.rs` +
 //! `scheduler_bridge.rs` genuinely save/restore two independently-running
 //! kernel tasks' stack pointers and callee-saved registers, driven by the
-//! real hardware timer and the real `RunQueue` scheduling decision — see
-//! `context.rs`'s module docs for exactly how that's safe to do from
-//! inside an interrupt handler.
+//! real hardware timer) and real hardware page tables (`paging.rs`): a
+//! real `OffsetPageTable` over the CPU's actual CR3, a kernel heap that's
+//! really mapped page-by-page instead of static BSS (`allocator.rs`), and
+//! a real page fault deliberately triggered and demand-paged by
+//! `interrupts.rs`'s handler.
 
 #![no_std]
 #![no_main]
@@ -36,26 +34,35 @@ mod allocator;
 mod context;
 mod gdt;
 mod interrupts;
+mod paging;
 mod pit;
 mod qemu_exit;
 mod scheduler_bridge;
 mod serial;
 
 use bootloader_api::{BootInfo, entry_point};
-use bootloader_api::config::BootloaderConfig;
+use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::info::MemoryRegionKind;
 use core::panic::PanicInfo;
+use core::sync::atomic::Ordering;
+use x86_64::VirtAddr;
 
 use qemu_exit::{ExitCode, exit_qemu};
 use uosc_core::boot::{BootPhase, BootSequencer};
 use uosc_core::capability::{CapabilityBroker, EnforcementDecision, Permissions, ResourceType};
 use uosc_core::ipc::PortTable;
-use uosc_core::memory::PhysicalAllocator;
 use uosc_core::sanctum::{VaultManager, VaultType};
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.kernel_stack_size = 128 * 1024;
+    // Ask the bootloader to map the entire real physical address space at
+    // some virtual offset it picks (`Mapping::Dynamic`) and report that
+    // offset back in `BootInfo::physical_memory_offset`. Without this,
+    // there is no way to reach arbitrary physical frames (e.g. a
+    // newly-allocated page table's own backing frame) from virtual
+    // addresses at all — `paging.rs` depends on it.
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
     config
 };
 
@@ -92,7 +99,54 @@ impl CheckResults {
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::init();
     serial_println!("UOSC x86-64 — real boot starting");
-    allocator::init();
+
+    // --- Real hardware page tables: build the OffsetPageTable first (no
+    // heap needed for this part — see paging.rs). ---
+    let physical_memory_offset = VirtAddr::new(
+        boot_info
+            .physical_memory_offset
+            .into_option()
+            .expect("bootloader did not map physical memory — check BOOTLOADER_CONFIG.mappings.physical_memory"),
+    );
+    let mut mapper = unsafe { paging::init(physical_memory_offset) };
+
+    let largest_usable = boot_info
+        .memory_regions
+        .iter()
+        .filter(|r| r.kind == MemoryRegionKind::Usable)
+        .max_by_key(|r| r.end - r.start)
+        .expect("no usable memory region reported by the bootloader");
+    let region_start = largest_usable.start;
+    let total_pages = ((largest_usable.end - largest_usable.start) / uosc_core::memory::PAGE_SIZE).min(1 << 20);
+    serial_println!(
+        "[memory] real usable region {:#x}..{:#x}, using {} pages for the real PhysicalAllocator",
+        largest_usable.start,
+        largest_usable.end,
+        total_pages
+    );
+
+    // --- Phase 1 of the kernel heap: a heap-free bump allocator maps the
+    // bootstrap heap, since the real, persistent PhysicalAllocator that
+    // will come next itself needs a working heap to construct (see
+    // allocator.rs's module docs for the two real bugs this took to get
+    // right). Its frames come off the front of the real usable region;
+    // the real PhysicalAllocator below is handed everything *after* them,
+    // so nothing double-allocates those pages. ---
+    let bootstrap_pages = allocator::BOOTSTRAP_HEAP_SIZE / uosc_core::memory::PAGE_SIZE;
+    let mut bump = paging::BumpFrameAllocator::new(region_start);
+    allocator::init_bootstrap(&mut mapper, &mut bump);
+
+    // --- Now that a real heap exists, the real, persistent
+    // PhysicalAllocator can actually be constructed. ---
+    paging::store_globals(
+        mapper,
+        region_start + bootstrap_pages * uosc_core::memory::PAGE_SIZE,
+        total_pages - bootstrap_pages,
+    );
+
+    // --- Phase 2 of the kernel heap: extend the same live heap with more
+    // real pages, now that the real PhysicalAllocator is available. ---
+    allocator::extend_with_real_pages();
 
     let mut seq = BootSequencer::new();
     let mut results = CheckResults::new();
@@ -119,36 +173,58 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     x86_64::instructions::interrupts::enable();
     results.record("LateBoot: PIC/PIT/interrupts enabled", seq.complete(BootPhase::LateBoot).is_ok());
 
-    // --- Real physical memory: feed the bootloader's actual memory map
-    // into PhysicalAllocator, using the largest single usable region
-    // (the allocator manages one contiguous arena — see reference-rs's
-    // STATUS.md; a multi-region allocator is real, separate follow-on work) ---
-    let largest_usable = boot_info
-        .memory_regions
-        .iter()
-        .filter(|r| r.kind == MemoryRegionKind::Usable)
-        .max_by_key(|r| r.end - r.start);
-
-    let mut phys_alloc_ok = false;
-    if let Some(region) = largest_usable {
-        let page_size = uosc_core::memory::PAGE_SIZE;
-        let total_pages = ((region.end - region.start) / page_size).min(1 << 20);
-        serial_println!(
-            "[memory] real usable region {:#x}..{:#x}, using {} pages for PhysicalAllocator",
-            region.start,
-            region.end,
-            total_pages
-        );
-        let mut phys = PhysicalAllocator::new(region.start, total_pages);
+    // --- Real physical memory: the alloc/dealloc round-trip now runs
+    // against the one persistent global PhysicalAllocator that paging and
+    // the heap already share, not a disposable scratch instance. ---
+    let phys_alloc_ok = paging::with_phys(|phys| {
         let before = phys.free_page_count();
-        if let Ok(p1) = phys.allocate(0) {
-            if let Ok(p2) = phys.allocate(0) {
-                phys_alloc_ok = p1 != p2 && phys.deallocate(p1).is_ok() && phys.deallocate(p2).is_ok()
-                    && phys.free_page_count() == before;
+        match (phys.allocate(0), phys.allocate(0)) {
+            (Ok(p1), Ok(p2)) => {
+                p1 != p2
+                    && phys.deallocate(p1).is_ok()
+                    && phys.deallocate(p2).is_ok()
+                    && phys.free_page_count() == before
             }
+            _ => false,
         }
-    }
+    })
+    .unwrap_or(false);
     results.record("Memory: real PhysicalAllocator over real bootloader memory map", phys_alloc_ok);
+
+    // --- Real hardware page tables: the kernel heap allocated above is
+    // already proof mapping works, but a direct check makes the causality
+    // explicit — allocate a real, multi-page Vec through the real
+    // #[global_allocator], write recognizable values across a range wide
+    // enough to span more than one of the pages allocator::init mapped,
+    // and read them back. ---
+    let heap_ok = {
+        let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(4096);
+        for i in 0..4096u64 {
+            v.push(i.wrapping_mul(0x9E3779B97F4A7C15));
+        }
+        v.iter().enumerate().all(|(i, &x)| x == (i as u64).wrapping_mul(0x9E3779B97F4A7C15))
+    };
+    results.record("Paging: real kernel heap, mapped through real hardware page tables, holds real data", heap_ok);
+
+    // --- Real page fault, deliberately triggered and demand-paged. The
+    // write below faults on real hardware (nothing has mapped this
+    // address yet), the real page_fault_handler catches it, maps a real
+    // page on the spot, and the faulting instruction genuinely resumes —
+    // the read-back below only succeeds if that whole real recovery path
+    // actually ran. ---
+    let page_fault_ok = {
+        let ptr = paging::DEMAND_PAGE_REGION_START as *mut u64;
+        unsafe {
+            ptr.write_volatile(0xDEAD_BEEF_CAFE_D00D);
+        }
+        let value_ok = unsafe { ptr.read_volatile() } == 0xDEAD_BEEF_CAFE_D00D;
+        let handler_ran = interrupts::PAGE_FAULTS_DEMAND_PAGED.load(Ordering::SeqCst) == 1;
+        value_ok && handler_ran
+    };
+    results.record(
+        "PageFault: a real #PF was triggered and demand-paged by the real handler, then resumed",
+        page_fault_ok,
+    );
 
     // --- Real capability check ---
     let mut caps = CapabilityBroker::new();
@@ -198,12 +274,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
 
     // --- Let real hardware timer interrupts actually drive the real
-    // scheduler for a while. This loop's own execution context is what
-    // gets suspended by the very first real context switch (see
-    // `context.rs`) — this `hlt()` call is where kernel_main's flow
-    // pauses until `scheduler_bridge`'s tick budget hands control back,
-    // at which point this loop resumes exactly here and keeps counting
-    // down, completely transparently. ---
+    // scheduler for a while. In practice the very first real context
+    // switch (see `context.rs`) fires well before this loop even starts —
+    // any timer tick from the moment `scheduler_bridge::init()` populates
+    // the RunQueue onward is eligible, so kernel_main's own flow can get
+    // suspended mid-instruction anywhere after that point (observed: mid-
+    // way through the Sanctum/Ipc checks above). Wherever it happens,
+    // `scheduler_bridge`'s tick budget hands control back to exactly that
+    // suspended point once it's spent, completely transparently — this
+    // loop is just where kernel_main is guaranteed to still be waiting if
+    // the switch-away happened even earlier than here. ---
     for _ in 0..1000 {
         x86_64::instructions::hlt();
     }

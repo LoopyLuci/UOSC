@@ -9,6 +9,7 @@
 //! `uosc_core::scheduler::RunQueue` — every PIT tick calls
 //! `SCHEDULER.lock().tick()`, which is the real preemption point.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::Mutex;
@@ -16,6 +17,12 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 use crate::serial_println;
+
+/// How many real page faults the handler has actually caught and
+/// demand-paged — read back by the boot self-test to confirm the fault
+/// really was raised and handled by hardware, not that the memory just
+/// happened to already be mapped.
+pub static PAGE_FAULTS_DEMAND_PAGED: AtomicU64 = AtomicU64::new(0);
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -56,13 +63,36 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 
+/// Real demand paging: a fault inside `paging::DEMAND_PAGE_REGION_*` gets a
+/// real physical frame mapped in on the spot, via the same real
+/// `PhysicalAllocator`/`OffsetPageTable` everything else in this kernel
+/// shares, and execution resumes — the faulting instruction actually
+/// retries and succeeds, on real (emulated) hardware. Anything outside
+/// that region is a real, unrecoverable fault and still panics.
 extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFrame, error_code: x86_64::structures::idt::PageFaultErrorCode) {
     use x86_64::registers::control::Cr2;
-    serial_println!(
-        "EXCEPTION: PAGE FAULT at {:?}, error {:?}\n{:#?}",
-        Cr2::read(),
-        error_code,
-        stack_frame
+    use x86_64::structures::paging::PageTableFlags;
+    use x86_64::VirtAddr;
+
+    let faulting_addr = Cr2::read_raw();
+
+    if (crate::paging::DEMAND_PAGE_REGION_START..crate::paging::DEMAND_PAGE_REGION_END).contains(&faulting_addr) {
+        let page_vaddr = VirtAddr::new(faulting_addr & !0xFFF);
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let mapped = crate::paging::with_mapper_and_phys(|mapper, phys| {
+            crate::paging::map_page(mapper, phys, page_vaddr, flags).is_ok()
+        })
+        .unwrap_or(false);
+        if mapped {
+            PAGE_FAULTS_DEMAND_PAGED.fetch_add(1, Ordering::SeqCst);
+            serial_println!("[page_fault] real #PF at {:#x}, demand-paged and resumed", faulting_addr);
+            return;
+        }
+    }
+
+    panic!(
+        "EXCEPTION: PAGE FAULT at {:#x}, error {:?} — outside the demand-page region, cannot recover\n{:#?}",
+        faulting_addr, error_code, stack_frame
     );
 }
 
