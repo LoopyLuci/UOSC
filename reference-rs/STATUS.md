@@ -146,6 +146,38 @@ of these were invisible until now:
     machine-checked counterexample (an empty region list), followed by the
     real three-way characterization that actually holds.
 
+## A real bug found in this crate itself, not the Titan source
+
+Every bug above was in the specification this crate replaced. This one is
+different: a real correctness/efficiency bug in `PhysicalAllocator::
+seed_free_lists` (`memory.rs`) that survived this crate's own 64 passing
+tests, `cargo clippy`, and every prior `kernel-x86_64` boot — because it
+never actually broke anything running against a host machine's
+effectively unlimited heap, or against the small alloc/dealloc self-tests
+earlier `kernel-x86_64` passes happened to run.
+
+The bound it used to pick each free block's size — `remaining.trailing_zeros()`
+— finds the largest power of two that *evenly divides* `remaining`, not
+the largest one that merely *fits within* it. For almost any oddly-bit-
+patterned `total_pages` (a completely ordinary real value: 27437 real
+pages), that forces single-page (order-0) blocks from the very first
+iteration onward, cascading into a near-linear number of tiny blocks
+instead of the intended O(log n) — tens of thousands of individual `Vec`
+pushes for a real, multi-gigabyte memory region. `kernel-x86_64`'s new
+real, hardware-page-mapped kernel heap (see its `STATUS.md`) is tightly
+bounded (256 KiB for exactly this kind of bootstrap work), and that's
+what finally turned an invisible inefficiency into a real, observed
+`memory allocation of 262144 bytes failed` panic — a genuine integration
+bug a correctness-only test suite was never going to catch, since
+`seed_free_lists`'s *output* (an allocator that still allocates and frees
+correctly) was never wrong, only wastefully constructed.
+
+Fixed by using `remaining.ilog2()` — the largest power of two *not
+exceeding* `remaining` — which is what "largest aligned power-of-two block
+that fits" actually requires. All 64 existing tests still pass unchanged
+(this was never a correctness bug from the test suite's point of view,
+only from a real, memory-constrained caller's).
+
 ## What this deliberately does not claim
 
 - **No bootable binary.** This is portable logic — no boot sequence, no

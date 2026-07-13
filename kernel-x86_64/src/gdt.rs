@@ -22,13 +22,27 @@ lazy_static! {
             let stack_start = VirtAddr::from_ptr(&raw const STACK);
             stack_start + STACK_SIZE as u64
         };
+        // RSP0: the kernel stack the CPU loads automatically on any trap
+        // that raises the privilege level to ring 0 with no IST override —
+        // exactly what happens the moment `syscall.rs`'s ring-3 demo
+        // executes `int 0x80`. Without this set, that trap would run on
+        // whatever garbage (zeroed) stack pointer the TSS starts with.
+        tss.privilege_stack_table[0] = {
+            const STACK_SIZE: usize = 4096 * 5;
+            static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+            #[allow(static_mut_refs)]
+            let stack_start = VirtAddr::from_ptr(&raw const STACK);
+            stack_start + STACK_SIZE as u64
+        };
         tss
     };
 }
 
-struct Selectors {
+pub struct Selectors {
     code_selector: x86_64::structures::gdt::SegmentSelector,
     tss_selector: x86_64::structures::gdt::SegmentSelector,
+    pub user_code_selector: x86_64::structures::gdt::SegmentSelector,
+    pub user_data_selector: x86_64::structures::gdt::SegmentSelector,
 }
 
 lazy_static! {
@@ -36,8 +50,19 @@ lazy_static! {
         let mut gdt = GlobalDescriptorTable::new();
         let code_selector = gdt.append(Descriptor::kernel_code_segment());
         let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
-        (gdt, Selectors { code_selector, tss_selector })
+        // Real ring-3 descriptors, used by `syscall.rs` to actually drop
+        // to CPL3 — `GlobalDescriptorTable::append` bakes each
+        // descriptor's own DPL into the returned selector's RPL bits
+        // automatically, so these are already ring-3-ready selectors, no
+        // manual `| 3` needed.
+        let user_data_selector = gdt.append(Descriptor::user_data_segment());
+        let user_code_selector = gdt.append(Descriptor::user_code_segment());
+        (gdt, Selectors { code_selector, tss_selector, user_code_selector, user_data_selector })
     };
+}
+
+pub fn selectors() -> &'static Selectors {
+    &GDT.1
 }
 
 pub fn init() {

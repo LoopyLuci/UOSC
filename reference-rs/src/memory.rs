@@ -78,11 +78,30 @@ impl PhysicalAllocator {
     /// Break the arena into the largest aligned power-of-two blocks that
     /// fit, so allocation can start by finding/splitting the smallest
     /// sufficient block rather than a linear scan.
+    ///
+    /// **Real bug found and fixed** (surfaced by `kernel-x86_64`'s real,
+    /// tightly-bounded bootstrap heap — invisible under `cargo test`'s
+    /// effectively unlimited host heap): the original bound here was
+    /// `remaining.trailing_zeros()`, which picks the largest block *size
+    /// that evenly divides* `remaining`, not the largest block size that
+    /// merely *fits within* it. For almost any odd or oddly-bit-patterned
+    /// `total_pages` (e.g. 27437), that forces order-0 (single-page)
+    /// blocks from the very first iteration onward, cascading into a near
+    /// -linear number of tiny blocks instead of the intended O(log n) —
+    /// tens of thousands of single-`u64` `Vec` pushes for a real,
+    /// multi-gigabyte memory region, which is exactly what turned into a
+    /// real `memory allocation of 262144 bytes failed` panic the first
+    /// time this ran against a real, size-constrained kernel heap rather
+    /// than a host test harness. The correct bound is `remaining.ilog2()`
+    /// — the largest power of two *not exceeding* `remaining` — which is
+    /// what "largest aligned power-of-two block that fits" actually
+    /// requires; the alignment bound below is unchanged and already
+    /// correct.
     fn seed_free_lists(&mut self) {
         let mut addr = self.base;
         let mut remaining = self.total_pages;
         while remaining > 0 {
-            let mut order = remaining.trailing_zeros().min(MAX_ORDER);
+            let mut order = remaining.ilog2().min(MAX_ORDER);
             // Also bound by alignment of addr itself (in page units).
             let page_index = (addr - self.base) / PAGE_SIZE;
             if page_index != 0 {

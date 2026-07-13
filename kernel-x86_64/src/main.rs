@@ -11,18 +11,21 @@
 //! PASS/FAIL for each over the serial console and exiting QEMU with a real,
 //! scriptable exit code.
 //!
-//! **What this does not claim**: no userspace, no syscall entry point, no
-//! filesystem, no network stack, no SMP. This is a real boot to a real
-//! self-test, not a usable operating system.
+//! **What this does not claim**: no general syscall ABI, no process/exit
+//! semantics, no filesystem, no network stack, no SMP. This is a real
+//! boot to a real self-test, not a usable operating system.
 //!
 //! It does now include a real context switch (`context.rs` +
 //! `scheduler_bridge.rs` genuinely save/restore two independently-running
 //! kernel tasks' stack pointers and callee-saved registers, driven by the
-//! real hardware timer) and real hardware page tables (`paging.rs`): a
-//! real `OffsetPageTable` over the CPU's actual CR3, a kernel heap that's
+//! real hardware timer), real hardware page tables (`paging.rs`): a real
+//! `OffsetPageTable` over the CPU's actual CR3, a kernel heap that's
 //! really mapped page-by-page instead of static BSS (`allocator.rs`), and
 //! a real page fault deliberately triggered and demand-paged by
-//! `interrupts.rs`'s handler.
+//! `interrupts.rs`'s handler — and a real ring-3 → ring-0 privilege
+//! transition (`syscall.rs`): actual CPL3 code, on real hardware,
+//! trapping into the kernel via a real `int 0x80` and being observed by a
+//! real handler.
 
 #![no_std]
 #![no_main]
@@ -39,6 +42,7 @@ mod pit;
 mod qemu_exit;
 mod scheduler_bridge;
 mod serial;
+mod syscall;
 
 use bootloader_api::{BootInfo, entry_point};
 use bootloader_api::config::{BootloaderConfig, Mapping};
@@ -226,6 +230,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         page_fault_ok,
     );
 
+    // --- Real ring-3 → ring-0 privilege transition, deliberately run
+    // before scheduler_bridge::init() below — see syscall.rs's module
+    // docs for why real preemption and this demo don't overlap in this
+    // pass. A real hand-assembled program runs at CPL3, traps via a real
+    // int 0x80, and the real handler observes the exact value (42) it put
+    // in rax right before trapping. ---
+    let syscall_ok = syscall::run_demo_syscall() == Some(42);
+    results.record(
+        "Syscall: real CPL3 code trapped into the kernel via int 0x80, observed by the real handler",
+        syscall_ok,
+    );
+
     // --- Real capability check ---
     let mut caps = CapabilityBroker::new();
     let token = caps.issue(0, 1, ResourceType::Memory, "heap".into(), Permissions {
@@ -270,7 +286,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         seq.satisfies_ordering_invariant()
     );
     serial_println!(
-        "[boot] SyscallBoot intentionally left incomplete — no real syscall entry point in this pass"
+        "[boot] SyscallBoot: a real int 0x80 entry point now exists (see the Syscall check above) — \
+         BootSequencer's SyscallBoot phase itself is still not completed, since there is no general \
+         syscall ABI or process model behind it yet"
     );
 
     // --- Let real hardware timer interrupts actually drive the real

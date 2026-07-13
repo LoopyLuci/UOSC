@@ -43,13 +43,15 @@ qemu-system-x86_64 -drive format=raw,file=uosc-bios.img \
 
 ```
 UOSC x86-64 — real boot starting
-[memory] real usable region 0x146e000..0x7fe0000, using 27506 pages for the real PhysicalAllocator
+[memory] real usable region 0x1473000..0x7fe0000, using 27501 pages for the real PhysicalAllocator
 [PASS] EarlyBoot: GDT + IDT installed
 [PASS] LateBoot: PIC/PIT/interrupts enabled
 [PASS] Memory: real PhysicalAllocator over real bootloader memory map
 [PASS] Paging: real kernel heap, mapped through real hardware page tables, holds real data
 [page_fault] real #PF at 0x555555550000, demand-paged and resumed
 [PASS] PageFault: a real #PF was triggered and demand-paged by the real handler, then resumed
+[syscall] real int 0x80 trap from ring 3, rax=42
+[PASS] Syscall: real CPL3 code trapped into the kernel via int 0x80, observed by the real handler
 [PASS] Capability: real CapabilityBroker grants the issuer and denies a stranger
 [scheduler_bridge] real RunQueue + 2 real task contexts initialized
 [PASS] SchedulerBoot: real RunQueue initialized
@@ -69,10 +71,10 @@ UOSC x86-64 — real boot starting
 [PASS] Ipc: real capability-checked send/receive round-trip
 [PASS] IpcBoot phase
 [boot] BootSequencer ordering invariant holds: true
-[boot] SyscallBoot intentionally left incomplete — no real syscall entry point in this pass
+[boot] SyscallBoot: a real int 0x80 entry point now exists (see the Syscall check above) — BootSequencer's SyscallBoot phase itself is still not completed, since there is no general syscall ABI or process model behind it yet
 [PASS] Scheduler: real context switches actually ran both kernel tasks, driven by the real hardware timer
 
-=== UOSC boot self-test: 12/12 checks passed ===
+=== UOSC boot self-test: 13/13 checks passed ===
 ```
 
 QEMU's process exit code: `33`, which decodes (per `isa-debug-exit`'s
@@ -114,13 +116,15 @@ below), byte-for-byte identical pass/fail shape each time.
    too, not a disposable scratch copy.
 6. **A real page fault, deliberately triggered and demand-paged.** See
    "Real hardware page tables" below.
-7. **Real capability, sanctum, and IPC checks** — `uosc_core::capability`,
+7. **A real ring-3 → ring-0 privilege transition.** See "Real ring-3
+   syscall" below.
+8. **Real capability, sanctum, and IPC checks** — `uosc_core::capability`,
    `uosc_core::sanctum`, and `uosc_core::ipc` run their real logic (issue a
    token, grant the issuer, deny a stranger; create a vault, enter it,
    confirm inside-region access and outside-region denial; create a port,
    send and receive a capability-checked message) against real allocated
    state, not test fixtures.
-8. **Real hardware-timer-driven scheduling, with a real context switch.**
+9. **Real hardware-timer-driven scheduling, with a real context switch.**
    The PIT fires a real interrupt at 200 Hz; each one calls into
    `scheduler_bridge.rs`, which runs the real
    `uosc_core::scheduler::RunQueue::pick_next_task`/`update_vruntime` — the
@@ -128,10 +132,10 @@ below), byte-for-byte identical pass/fail shape each time.
    general n-task proof cover — and now, when that decision actually
    changes which task should run, calls `context::switch_to` to really
    switch the CPU to it. See "Real context switching" below for how.
-9. **`uosc_core::boot::BootSequencer`** tracks real phase completion as
-   each step above finishes, and `satisfies_ordering_invariant()` — the
-   same function `Boot.lean` proves preserves Property 10 — is checked live
-   at the end, not just in a unit test.
+10. **`uosc_core::boot::BootSequencer`** tracks real phase completion as
+    each step above finishes, and `satisfies_ordering_invariant()` — the
+    same function `Boot.lean` proves preserves Property 10 — is checked
+    live at the end, not just in a unit test.
 
 ## Real hardware page tables
 
@@ -187,6 +191,69 @@ a registered region in the portable model); anything else still panics,
 so a wild pointer dereference stays a diagnosable fault instead of being
 silently papered over.
 
+**A third real bug, found this later pass but rooted here**: adding
+`syscall.rs` grew the kernel binary enough to shift `PhysicalAllocator`'s
+real starting page count to 27437 — and that specific, perfectly ordinary
+value made `reference-rs`'s `PhysicalAllocator::seed_free_lists` blow up
+into tens of thousands of tiny `Vec` pushes instead of a handful of large
+ones, overflowing the 256 KiB bootstrap heap with a real `memory
+allocation of 262144 bytes failed` panic. Not a bug in this crate — a real
+bug in the already-"64 tests passing" `reference-rs` library itself,
+invisible until a real, tightly-bounded kernel heap finally made the
+difference between "wasteful" and "fails." Full writeup and fix in
+`../reference-rs/STATUS.md`.
+
+## Real ring-3 syscall
+
+`syscall.rs` is new this pass: a real ring-3 (CPL3) → ring-0 privilege
+transition, not CPL0 code merely pretending to be "userspace." A real
+hand-assembled 9-byte program (`mov eax, 42; int 0x80; jmp $`) runs at
+CPL3 on real hardware, traps into the kernel via a real `int 0x80`, and
+the real handler observes the exact value it put in `rax`. Full mechanism
+in `syscall.rs`'s module docs; short version:
+
+- `enter_ring3` (naked `asm!`) saves the kernel's stack pointer and
+  callee-saved registers — the same convention as
+  [`context::switch_to`] — then builds a real `iretq` frame with real
+  ring-3 GDT selectors (`gdt.rs`'s new `Descriptor::user_code_segment()`/
+  `user_data_segment()`) and executes `iretq` to actually drop to CPL3.
+- The ring-3 program is hand-assembled bytes, not a compiled Rust
+  function's address — its exact length has to be known with certainty
+  when copying it into a freshly mapped, real, user-accessible page, and
+  hand-assembling avoids any risk of position-dependent relocations
+  breaking when the bytes move to a new address.
+- `int 0x80` traps into `syscall_entry_stub`, installed by raw address
+  (`Entry::set_handler_addr`, not the typed `extern "x86-interrupt"`
+  convention, since reading `rax` at the trap needs the real register
+  file) with DPL set to `Ring3` so a real `int 0x80` from CPL3 doesn't
+  raise a real `#GP` first.
+- The stub deliberately never `iretq`s back to ring 3 — there's no
+  process/exit model to make a second syscall meaningful — instead it
+  abandons the ring-3 context and resumes the saved kernel context
+  directly, exactly like `scheduler_bridge.rs`'s `BOOT_PID` handback.
+
+**Two real bugs found getting this to actually work**, on top of the
+`seed_free_lists` bug above:
+
+1. A real link failure: `sym KERNEL_RETURN_RSP` used as `lea rax,
+   [{kernel_rsp}]` produced `relocation R_X86_64_32S cannot be used
+   against local symbol` — this kernel links as a PIE binary (`-pie` in
+   the real `rust-lld` invocation), so a `sym` reference needs explicit
+   RIP-relative addressing (`lea rax, [rip + {kernel_rsp}]`), not the
+   absolute-looking form that works for non-PIE targets.
+2. **A real, reproducible hang**, found only after the link fix: the
+   `int 0x80` IDT entry is (by `set_handler_addr`'s own documented
+   default) an *interrupt* gate, which clears `IF` on entry — normally
+   undone by the `iretq` a typed handler ends with. `syscall_entry_stub`
+   deliberately never `iretq`s (see above), so without an explicit `sti`,
+   `IF` stayed cleared *permanently* after the syscall demo returned —
+   every later timer tick silently stopped firing, and `main.rs`'s
+   `hlt()` loop (which only wakes on NMI when `IF=0`) hung forever the
+   first time it ran. No crash, no panic — just a real, silent, total
+   loss of interrupts, caught by noticing the self-test never finished
+   rather than by any error message. Fixed by an explicit `sti` before
+   the final `ret`.
+
 ## UEFI boot
 
 Previously built but not boot-tested (no OVMF firmware available in that
@@ -205,7 +272,7 @@ qemu-system-x86_64 \
 ```
 
 Real OVMF `BdsDxe` boot-manager output precedes the kernel's own, then the
-same self-test runs and passes: **12/12 checks, exit code 33.** Both boot
+same self-test runs and passes: **13/13 checks, exit code 33.** Both boot
 paths are now real, observed, passing runs, not one tested and one merely
 "should work."
 
@@ -293,10 +360,15 @@ hardware.
   1.25 MiB total, `allocator.rs`'s `BOOTSTRAP_HEAP_SIZE`/`REAL_HEAP_SIZE`)
   — real, page-mapped memory, but a hardcoded ceiling, not something that
   grows on demand past that.
-- **No userspace, no syscall entry point, no filesystem, no network, no
-  SMP.** `BootSequencer`'s `SyscallBoot` phase is deliberately left
-  incomplete — there is no real syscall handler in this pass, and the live
-  self-test output says so rather than silently marking it done.
+- **The ring-3 demo is real but narrow.** One hand-assembled program, one
+  trap, no return to ring 3, no second syscall, no process/exit semantics,
+  no SMEP/SMAP (the kernel can freely read/write/execute the "user"
+  pages), no NX enforcement (those pages are writable *and* executable).
+  `BootSequencer`'s `SyscallBoot` phase itself is still deliberately left
+  incomplete — a real trap-and-handle mechanism now exists, but there is
+  no general syscall ABI or process model behind it, and the live
+  self-test output says so rather than silently marking the phase done.
+- **No filesystem, no network, no SMP.**
 - **Not RISC-V, not AArch64, not on real (non-emulated) hardware.** QEMU is
   a real, high-fidelity emulator, not a rubber stamp — but it is not a
   substitute for real hardware bring-up, which needs real boards, real

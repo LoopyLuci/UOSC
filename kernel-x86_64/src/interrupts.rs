@@ -47,6 +47,19 @@ lazy_static! {
         idt.page_fault.set_handler_fn(page_fault_handler);
         idt[InterruptIndex::Timer as u8].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_interrupt_handler);
+        // Installed by raw address, not `set_handler_fn`: the real ring-3
+        // demo (`syscall.rs`) needs the actual register file at the trap
+        // (`rax` as the "syscall number"), which the typed
+        // `extern "x86-interrupt"` frame doesn't expose. DPL must be
+        // Ring3, or a real `int 0x80` from CPL3 raises a real #GP instead
+        // of reaching this handler — software interrupts otherwise
+        // default to requiring CPL <= the gate's DPL, same as any other
+        // privileged operation.
+        unsafe {
+            idt[0x80]
+                .set_handler_addr(x86_64::VirtAddr::new(crate::syscall::syscall_entry_stub as *const () as u64))
+                .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+        }
         idt
     };
 }
