@@ -42,6 +42,7 @@
 
 extern crate alloc;
 
+mod acpi_topology;
 mod address_space;
 mod allocator;
 mod context;
@@ -192,6 +193,45 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     results.record(
         "CpuSecurity: real EFER.NXE/CR4.SMEP/CR4.SMAP match what CPUID said was supported",
         cpu_security_ok,
+    );
+
+    // --- Real ACPI/MADT CPU topology discovery: the first real,
+    // independently-verifiable step toward SMP, not SMP itself — see
+    // acpi_topology.rs's module docs for exactly what this does and does
+    // not establish. Requires paging::init (above) to have already run, so
+    // acpi_topology's physical-memory-offset handler has something to read.
+    // The real proof this is correct isn't an internal assertion here (this
+    // kernel has no independent way to know how many CPUs QEMU was actually
+    // told to emulate) — it's booting with `-smp 1`, `-smp 2`, `-smp 4` and
+    // confirming the printed count matches each time, done as part of this
+    // change's validation pass, not as a compiled-in check. ---
+    let cpu_topology = boot_info
+        .rsdp_addr
+        .into_option()
+        .ok_or(())
+        .and_then(|rsdp| acpi_topology::discover(rsdp).map_err(|_| ()));
+    let acpi_topology_ok = match &cpu_topology {
+        Ok(topo) => topo.cpu_count() >= 1 && topo.local_apic_address != 0,
+        Err(()) => false,
+    };
+    if let Ok(topo) = &cpu_topology {
+        serial_println!(
+            "[acpi] real MADT: local_apic_address={:#x}, {} logical CPU(s) reported",
+            topo.local_apic_address,
+            topo.cpu_count()
+        );
+        for cpu in &topo.cpus {
+            serial_println!(
+                "[acpi]   processor_id={} apic_id={} enabled={}",
+                cpu.processor_id,
+                cpu.apic_id,
+                cpu.enabled
+            );
+        }
+    }
+    results.record(
+        "AcpiTopology: real MADT parsed via the real RSDP address, at least one enabled CPU reported",
+        acpi_topology_ok,
     );
 
     // --- EarlyBoot: GDT + IDT, mirroring kernel/boot.ti's early_boot ---

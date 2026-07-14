@@ -44,8 +44,11 @@ qemu-system-x86_64 -drive format=raw,file=uosc-bios.img \
 ```
 UOSC x86-64 — real boot starting
 [cpu] NX=true (EFER.NXE) SMEP=false SMAP=false (CR4), each gated on a real CPUID check
-[memory] real usable region 0x1472000..0x7fe0000, using 27502 pages for the real PhysicalAllocator
+[memory] real usable region 0x1473000..0x7fe0000, using 27501 pages for the real PhysicalAllocator
 [PASS] CpuSecurity: real EFER.NXE/CR4.SMEP/CR4.SMAP match what CPUID said was supported
+[acpi] real MADT: local_apic_address=0xfee00000, 1 logical CPU(s) reported
+[acpi]   processor_id=0 apic_id=0 enabled=true
+[PASS] AcpiTopology: real MADT parsed via the real RSDP address, at least one enabled CPU reported
 [PASS] EarlyBoot: GDT + IDT installed
 [PASS] LateBoot: PIC/PIT/interrupts enabled
 [PASS] Memory: real PhysicalAllocator over real bootloader memory map
@@ -96,39 +99,38 @@ UOSC x86-64 — real boot starting
 [PASS] TaskReuse: a task spawned live at runtime ran, really reusing the exact same guard-page-protected stack slot an exited task used
 [PASS] TaskAddressSpace: a real scheduled task ran with the ordinary timer-driven scheduler really switching CR3 to its own bound address space
 
-=== UOSC boot self-test: 19/19 checks passed ===
+=== UOSC boot self-test: 20/20 checks passed ===
 ```
 
 QEMU's process exit code: `33`, which decodes (per `isa-debug-exit`'s
 `(value << 1) | 1` convention) to `ExitCode::Success = 0x10` — a real,
 scriptable pass signal, not a human reading a terminal.
 
-**Reproduced across well over 300 independent BIOS/UEFI runs total across
-this crate's history**, most recently: 31 consecutive runs verifying NX/
-SMEP/SMAP, then a batch verifying page unmapping + task creation/exit
-that caught two real, separate, fixed intermittent bugs, then 66 further
-consecutive runs after those fixes (heap-allocated stacks, at the time),
-then a guard-page-protected-stack rewrite, which itself caught a real,
-100%-reproducible bug on its very first boot (a non-canonical region base
-address — see "Real guard-page-protected task stacks" below) and, once
-fixed, 51 further consecutive runs, then a one-time manual SMEP
-fault-and-recover verification (see "Real NX/SMEP/SMAP" above) plus 8
-further consecutive runs confirming the revert, then a second, genuinely
-independent address space (see "Real multiple address spaces" below),
-which passed on its first boot and 50 further consecutive runs, then this
-pass's real syscall ABI generalization and real task-to-address-space
-binding (see "Real, small syscall ABI" and "Real task-to-address-space
-binding" below), both of which also passed **on their first boot** — no
-bug found this time in either — and, since then, **51 further consecutive
-runs with zero failures** (25 on QEMU's default CPU model, 10 with `-cpu
-qemu64,+smep,+smap` forcing both on, 1 independent UEFI run, 15 more on a
-from-scratch clean rebuild). This many repeats weren't idle paranoia —
-real bugs were caught and fixed exactly because of this volume of testing
-at every stage; see "Real task creation and exit" and "Real
-guard-page-protected task stacks" below for the full list, including one
-older finding that remains honestly documented as *mitigated, not
-debugger-confirmed root-caused* even after a later pass's stronger,
-structural fix (see that section for exactly what is and isn't proven).
+**Reproduced across well over 340 independent BIOS runs total across this
+crate's history** (this pass added real, if partial, SMP work — see
+"Real ACPI/MADT CPU topology discovery" below — on top of well over 300
+runs already established for everything before it; see the git history
+of this file for the pre-existing tally), most recently: this pass's real
+ACPI/MADT CPU topology discovery passed clean on its own first boot (no
+bug found), then 20 further consecutive runs at default `-smp` (all
+20/20, exit 33), plus dedicated `-smp 2` and `-smp 4` boots each showing
+the exact matching CPU count and correct APIC IDs (0,1 and 0,1,2,3
+respectively) — real proof the discovered topology tracks real
+configuration, not a hardcoded "1" — plus one run with `-cpu
+qemu64,+smep,+smap` (still 20/20), plus a full `rm -rf target` clean
+rebuild that reproduced the same result. **UEFI was not re-verified this
+pass**: the `edk2-x86_64-secure-code.fd` firmware this repo's UEFI runs
+depend on is not present in this environment (no bundled copy, no scoop
+package) — this is an honest gap in *this pass's* testing, not a claim
+that UEFI boot is broken; it was verified in prior passes (see below) and
+nothing in this pass's change touches boot-mode-specific code. This many
+repeats weren't idle paranoia — real bugs were caught and fixed exactly
+because of this volume of testing at every stage; see "Real task creation
+and exit" and "Real guard-page-protected task stacks" below for the full
+list, including one older finding that remains honestly documented as
+*mitigated, not debugger-confirmed root-caused* even after a later pass's
+stronger, structural fix (see that section for exactly what is and isn't
+proven).
 
 ## What actually happens at boot, and what code runs it
 
@@ -846,6 +848,54 @@ wraps the pairing (a `TaskSlot` just holds an `Option<PhysFrame>`, not a
 first-class "process" concept with its own PID namespace, exit status, or
 resource accounting).
 
+## Real ACPI/MADT CPU topology discovery
+
+The first real, independently-verifiable step toward SMP — not SMP
+itself. `acpi_topology.rs` parses the real MADT (Multiple APIC
+Description Table) reachable from the real RSDP address the bootloader
+passes through (`BootInfo::rsdp_addr`), using the `acpi` crate. This
+kernel already maps the whole of physical memory at a fixed offset
+(`paging::phys_mem_offset()`), so the `acpi` crate's physical→virtual
+mapping callback is just that offset add, over memory this kernel's page
+tables already cover — nothing new needs mapping or unmapping to reach
+the tables.
+
+Enabling the `acpi` crate's MADT parsing pulls in its full `Handler`
+trait, which is really scoped for evaluating AML control methods (real
+port I/O, real legacy PCI configuration-space access via 0xCF8/0xCFC,
+real MMIO reads/writes) — none of which this module's actual code path
+exercises (it only calls `find_table::<Madt>`, which reads a static
+table and never touches the DSDT/SSDT AML bytecode at all). The
+MMIO/port-I/O/PCI-config methods are implemented for real anyway (simple,
+mechanical, and consistent with how `pit.rs` already does real port I/O)
+since they cost nothing extra to get right; the AML-runtime-only
+primitives (`nanos_since_boot`, `stall`, `sleep`, mutex create/acquire/
+release) are `unimplemented!()` with an explicit message, rather than a
+faked clock or lock this kernel has no real backing for yet — honest
+failure instead of an untested guess, safe because nothing in this
+module's real call path can reach them.
+
+**Real proof this works, not just that it compiles**: booted with
+default QEMU flags (1 CPU), `-smp 2`, and `-smp 4` — the kernel's printed
+CPU count and APIC IDs matched exactly every time (1; then 0,1; then
+0,1,2,3). This is the actual verification that matters here — this
+kernel has no independent way to know what `-smp` value QEMU was told to
+use, so an internal self-test assertion alone couldn't have caught a
+topology-parsing bug; only checking the real printed output against the
+real flag QEMU was launched with can.
+
+**Scope, stated plainly**: this discovers real CPU topology and nothing
+more. No AP (application processor) trampoline exists. No per-CPU GDT/
+TSS. No LAPIC or IOAPIC initialization (interrupts are still routed
+through the legacy 8259 PIC to a single core, as before). No code has
+ever run on any core but the boot processor. The scheduler, physical
+allocator, and kernel heap are all still implicitly single-core — none
+of them have been audited or made safe for genuine concurrent access
+from a second core, because nothing yet brings a second core up far
+enough to attempt it. Real SMP needs all of that; this is the first
+input every later piece of it will need (real APIC IDs to target),
+landed and verified on its own before building on top of it.
+
 ## The GDT/segment-register bug (from the context-switching pass)
 
 Setting up a brand-new GDT and switching `CS` to it is not enough on
@@ -928,7 +978,14 @@ hardware.
   read-only/read-write distinction beyond what already existed (every
   mapped page here is still `WRITABLE`); no protection-key (`PKU`)
   support; no CET/shadow stacks.
-- **No filesystem, no network, no SMP.**
+- **No filesystem, no network.**
+- **No SMP, still — real CPU topology discovery exists now (see "Real
+  ACPI/MADT CPU topology discovery" above) but nothing more.** No second
+  core has ever run any code. No AP trampoline, no per-CPU GDT/TSS, no
+  LAPIC/IOAPIC (interrupts still route through the legacy 8259 PIC to one
+  core). The scheduler, physical allocator, and kernel heap are all still
+  implicitly single-core and have not been audited for concurrent access
+  from a second core.
 - **Not RISC-V, not AArch64, not on real (non-emulated) hardware.** QEMU is
   a real, high-fidelity emulator, not a rubber stamp — but it is not a
   substitute for real hardware bring-up, which needs real boards, real
