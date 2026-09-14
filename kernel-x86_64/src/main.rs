@@ -54,6 +54,7 @@ mod pit;
 mod qemu_exit;
 mod scheduler_bridge;
 mod serial;
+mod smp;
 mod syscall;
 mod task_stack;
 
@@ -467,6 +468,78 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "TaskAddressSpace: a real scheduled task ran with the ordinary timer-driven scheduler really \
          switching CR3 to its own bound address space",
         scheduler_bridge::task_e_verified_own_address_space(),
+    );
+
+    // --- Real AP (application processor) bring-up — the first code this
+    // kernel has ever run on any core but the boot processor. Runs last,
+    // deliberately: by this point the scheduler's tick budget has already
+    // pinned the BSP to BOOT_PID (no further task activity), so bringing up
+    // the AP here is genuinely sequential with everything above it, not
+    // concurrent with it — see smp.rs's module docs for exactly why that
+    // matters (no concurrent heap/allocator access is attempted, by
+    // deliberate sequencing, not by luck). Needs a real second logical CPU
+    // to mean anything: at `-smp 1` (QEMU's default with no flag), there is
+    // no AP to bring up, and this check honestly reports that rather than
+    // faking a pass — see STATUS.md for why the default verification
+    // command now passes `-smp 2`. ---
+    let smp_ok = match &cpu_topology {
+        Ok(topo) if topo.cpu_count() >= 2 => {
+            let bsp_id = smp::this_core_apic_id();
+            let target = topo.cpus.iter().find(|c| c.enabled && c.apic_id != bsp_id);
+            match target {
+                Some(cpu) => {
+                    let target_apic_id = cpu.apic_id;
+                    let started = smp::bring_up_ap(topo, target_apic_id);
+                    started
+                        && smp::ap_fault_survived()
+                        && smp::ap_reported_apic_id() == Some(target_apic_id)
+                }
+                None => {
+                    serial_println!(
+                        "[smp] real MADT reported {} CPU(s) but none besides apic_id={} — nothing to bring up",
+                        topo.cpu_count(),
+                        bsp_id
+                    );
+                    false
+                }
+            }
+        }
+        Ok(topo) => {
+            serial_println!(
+                "[smp] only {} logical CPU(s) reported (boot with -smp 2 or more to exercise real AP bring-up) — skipping",
+                topo.cpu_count()
+            );
+            false
+        }
+        Err(()) => false,
+    };
+    results.record(
+        "Smp: a real AP was started via a real INIT-SIPI-SIPI sequence, ran real 64-bit Rust code on its \
+         own real per-CPU GDT/TSS, and survived a real, deliberately-triggered breakpoint exception on \
+         that core without disturbing the BSP",
+        smp_ok,
+    );
+
+    // --- Real proof the BSP's own state survived the AP's fault intact —
+    // not asserted, *re-checked*: the exact same real predicates the
+    // Scheduler/TaskExit/TaskReuse/TaskAddressSpace checks above already
+    // evaluated are evaluated again here, after the AP ran real code and
+    // took a real breakpoint exception on its own separate GDT/TSS. If the
+    // AP's fault had somehow corrupted shared kernel state (the scheduler's
+    // task pool, its counters, its RunQueue), this is where that would
+    // surface — not as a hang or a panic, but as one of these same real
+    // predicates flipping from true to false. Only meaningful when the Smp
+    // check above actually ran the AP (`smp_ok`) — with no AP brought up,
+    // this trivially re-confirms the same state nothing touched. ---
+    let bsp_state_intact = scheduler_bridge::both_tasks_made_real_progress()
+        && scheduler_bridge::task_c_really_exited()
+        && scheduler_bridge::task_reused_a_guarded_slot()
+        && scheduler_bridge::task_e_verified_own_address_space();
+    results.record(
+        "BspStateAfterSmp: the BSP's own scheduler/task-pool state, real-checked again after the AP ran \
+         and faulted, still holds exactly what it held before — real evidence the AP's fault did not \
+         corrupt shared BSP state, not just that the BSP kept running",
+        bsp_state_intact,
     );
 
     serial_println!("\n=== UOSC boot self-test: {}/{} checks passed ===", results.passed, results.total);

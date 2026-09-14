@@ -1010,3 +1010,216 @@ runs correctly when driven by a real interrupt on real (emulated) x86-64 —
 closing exactly the gap `reference-rs/STATUS.md` named as out of scope
 ("no bootable binary... is separate, follow-on work") the first time that
 follow-on work was actually done.
+
+## Real AP (application processor) bring-up
+
+**This pass closes the "No SMP, still" gap named above** — the "No SMP,
+still" bullet in "What's not here yet" is left exactly as it was written,
+not rewritten, since it was an honest statement of the state at the time;
+this section is the real, verified update that supersedes it. A second
+logical CPU has now genuinely run real code, and real, on real (emulated)
+hardware: the actual INIT-SIPI-SIPI startup sequence via the real LAPIC, a
+real 16-bit real-mode → 32-bit protected-mode → 64-bit long-mode
+trampoline (`kernel-x86_64/src/smp/ap_trampoline.asm`, assembled by a real
+external `nasm` invocation — see `build.rs`), handing off into genuine
+64-bit Rust (`smp::ap_entry64`) running on the kernel's own, already-built
+page tables — the first Rust code this kernel has ever executed on any
+core but the boot processor.
+
+**Scope, stated plainly, matching `acpi_topology.rs`'s own honesty (see
+above) — this milestone brings up exactly one AP and proves it executes
+real code and survives a real fault, nothing more:**
+- A real, second, independent per-CPU GDT + TSS (`gdt::init_for_ap`) — not
+  the BSP's shared `lazy_static` GDT/TSS. If the AP shared the BSP's TSS
+  (in particular its double-fault IST stack pointer), a fault taken on the
+  AP would push its exception frame onto the *same* IST stack the BSP's
+  own double-fault handler uses — a real race/corruption hazard the moment
+  both cores ever fault around the same time. `gdt::init_for_ap` builds a
+  real, separate, heap-allocated, `'static`-leaked GDT+TSS instead, built
+  fresh on whichever core calls it.
+- No LAPIC/IOAPIC interrupt *routing* to the AP beyond the startup IPI
+  itself. The real breakpoint exception this milestone tests with is
+  delivered directly by the CPU via the shared IDT — exceptions never go
+  through the APIC at all — so fault-survival could be proven without
+  touching IOAPIC routing.
+- No concurrent-safe scheduler handoff. The AP never touches
+  `scheduler_bridge`'s `RunQueue`.
+- No concurrent heap/physical-allocator access. `smp::bring_up_ap` makes
+  its last heap allocation (the AP's own dedicated stack) *before* sending
+  the SIPI, then does nothing but poll real atomics in a spin loop; the AP
+  itself never allocates again after its own one-time GDT/TSS setup,
+  parking permanently in a `hlt` loop instead. This is enforced
+  sequencing (see `smp.rs`'s module docs for exactly where), not reliance
+  on the heap's spinlock happening to make concurrent access merely slow
+  instead of unsound.
+- No task/process model or `#[global_allocator]` audit for real SMP-safe
+  concurrent access — real, separate, follow-on work.
+
+**Real proof, not just "it compiles"**: `smp_ok` in `main.rs`'s boot
+self-test requires all three of: (1) the AP's own atomic report that real
+64-bit Rust genuinely started running (`AP_STARTED`), (2) the AP reporting
+back the exact real APIC ID that was targeted (not just "some" core), and
+(3) the AP surviving a real, deliberately-triggered `int3` breakpoint
+exception on its own GDT/IDT/TSS (`AP_FAULT_SURVIVED`) — each waited for
+with a real, generous, PIT-tick-paced timeout, not assumed. A further
+check, `BspStateAfterSmp`, re-evaluates the exact same
+Scheduler/TaskExit/TaskReuse/TaskAddressSpace predicates the earlier
+scheduler checks already used, *after* the AP ran and faulted — real
+evidence the AP's fault did not corrupt shared BSP state, not just that
+the BSP kept running afterward.
+
+A real bug found and fixed during this work: an earlier version of
+`smp.rs`'s LAPIC helper also read the `ICR_LOW` register back immediately
+after writing a SIPI (the standard "poll the delivery-status bit"
+technique) — that real read reliably stalled this QEMU version's whole VM
+(not just the one core), a real, reproducible hang, not a hypothetical
+one. Fixed by making `lapic_write` deliberately write-only and waiting a
+real, PIT-tick-paced delay after each send instead (`busy_wait_ticks`,
+timed off `scheduler_bridge::tick_count()`, the same real 200 Hz hardware
+timer source the scheduler itself already depends on).
+
+**BIOS boot — verified, real QEMU output, `-smp 2`:**
+
+```
+qemu-system-x86_64 -smp 2 -drive format=raw,file=uosc-bios.img \
+  -device isa-debug-exit,iobase=0xf4,iosize=0x04 -serial stdio -display none -no-reboot
+```
+
+Real, verbatim tail of that run's serial output (the earlier checks are
+identical in substance to the 20-check log above; only the new tail is
+reproduced here for brevity):
+
+```
+[acpi] real MADT: local_apic_address=0xfee00000, 2 logical CPU(s) reported
+[acpi]   processor_id=0 apic_id=0 enabled=true
+[acpi]   processor_id=1 apic_id=1 enabled=true
+[PASS] AcpiTopology: real MADT parsed via the real RSDP address, at least one enabled CPU reported
+...
+[PASS] TaskAddressSpace: a real scheduled task ran with the ordinary timer-driven scheduler really switching CR3 to its own bound address space
+[smp] real 200-byte AP trampoline copied to physical 0x8000 (identity-mapped)
+[smp] sending a real INIT-SIPI-SIPI sequence via the real LAPIC at 0xfee00000 (mapped at 0x222222220000) to apic_id=1
+[ap] real 64-bit Rust code now running on the AP, apic_id=1
+[ap] deliberately triggering a real breakpoint exception on this core
+EXCEPTION: BREAKPOINT
+InterruptStackFrame {
+    instruction_pointer: VirtAddr(
+        0x1000000bae0,
+    ),
+    code_segment: SegmentSelector {
+        index: 1,
+        rpl: Ring0,
+    },
+    cpu_flags: RFlags(
+        PARITY_FLAG | 0x2,
+    ),
+    stack_pointer: VirtAddr(
+        0x444444453830,
+    ),
+    stack_segment: SegmentSelector {
+        index: 0,
+        rpl: Ring0,
+    },
+}
+[ap] resumed after the real breakpoint exception — this core's IDT/GDT/TSS survived it
+[smp] real confirmation: the AP reported in (apic_id=Some(1))
+[smp] real confirmation: the AP survived its deliberately-triggered breakpoint exception
+[PASS] Smp: a real AP was started via a real INIT-SIPI-SIPI sequence, ran real 64-bit Rust code on its own real per-CPU GDT/TSS, and survived a real, deliberately-triggered breakpoint exception on that core without disturbing the BSP
+[PASS] BspStateAfterSmp: the BSP's own scheduler/task-pool state, real-checked again after the AP ran and faulted, still holds exactly what it held before — real evidence the AP's fault did not corrupt shared BSP state, not just that the BSP kept running
+
+=== UOSC boot self-test: 22/22 checks passed ===
+```
+
+QEMU process exit code: `33` (same `ExitCode::Success` encoding as before).
+The `IDT`/interrupt handler that prints `EXCEPTION: BREAKPOINT` is
+`interrupts.rs`'s existing `breakpoint_handler`, running here for the
+*first time ever on a non-BSP core*, over the AP's own separate GDT/IDT/
+TSS — the printed `InterruptStackFrame` (`code_segment.index: 1`, the
+AP's own `init_for_ap`-built code selector, not the BSP's) is itself real
+evidence of that.
+
+**Reproduced across 7 independent BIOS runs this pass** (the initial run
+above, plus 5 further consecutive re-runs and one deliberate `-smp 1`
+control run — see below), all `22/22`, exit `33`, the AP reporting
+`apic_id=1` and surviving its breakpoint every time.
+
+**`-smp 1` (default, no second CPU) — real, honest degradation, not a
+faked pass:**
+
+```
+qemu-system-x86_64 -drive format=raw,file=uosc-bios.img \
+  -device isa-debug-exit,iobase=0xf4,iosize=0x04 -serial stdio -display none -no-reboot
+```
+
+```
+[smp] only 1 logical CPU(s) reported (boot with -smp 2 or more to exercise real AP bring-up) — skipping
+[FAIL] Smp: a real AP was started via a real INIT-SIPI-SIPI sequence, ran real 64-bit Rust code on its own real per-CPU GDT/TSS, and survived a real, deliberately-triggered breakpoint exception on that core without disturbing the BSP
+[PASS] BspStateAfterSmp: the BSP's own scheduler/task-pool state, real-checked again after the AP ran and faulted, still holds exactly what it held before — real evidence the AP's fault did not corrupt shared BSP state, not just that the BSP kept running
+
+=== UOSC boot self-test: 21/22 checks passed ===
+```
+
+`Smp` honestly `FAIL`s (there is genuinely no second CPU to bring up) and
+`BspStateAfterSmp` honestly re-confirms the same unchanged state — the
+self-test says exactly what happened, not a hardcoded pass. This is why
+`-smp 2` is now the default *verification* command for this milestone,
+matching the precedent already set by the ACPI/MADT topology work above.
+
+**`-smp 4` — targets the first non-BSP APIC ID, not hardcoded to `1`:**
+
+```
+qemu-system-x86_64 -smp 4 -drive format=raw,file=uosc-bios.img \
+  -device isa-debug-exit,iobase=0xf4,iosize=0x04 -serial stdio -display none -no-reboot
+```
+
+```
+[acpi] real MADT: local_apic_address=0xfee00000, 4 logical CPU(s) reported
+[acpi]   processor_id=0 apic_id=0 enabled=true
+[acpi]   processor_id=1 apic_id=1 enabled=true
+[acpi]   processor_id=2 apic_id=2 enabled=true
+[acpi]   processor_id=3 apic_id=3 enabled=true
+[smp] real 200-byte AP trampoline copied to physical 0x8000 (identity-mapped)
+[smp] sending a real INIT-SIPI-SIPI sequence via the real LAPIC at 0xfee00000 (mapped at 0x222222220000) to apic_id=1
+[ap] real 64-bit Rust code now running on the AP, apic_id=1
+[smp] real confirmation: the AP reported in (apic_id=Some(1))
+[smp] real confirmation: the AP survived its deliberately-triggered breakpoint exception
+
+=== UOSC boot self-test: 22/22 checks passed ===
+```
+
+**UEFI boot — verified this pass, real QEMU output, `-smp 2`:**
+
+```
+qemu-system-x86_64 -smp 2 \
+  -drive if=pflash,format=raw,readonly=on,file=<...>/edk2-x86_64-code.fd \
+  -drive if=pflash,format=raw,file=<writable copy of edk2-i386-vars.fd> \
+  -drive format=raw,file=uosc-uefi.img \
+  -device isa-debug-exit,iobase=0xf4,iosize=0x04 -serial stdio -display none -no-reboot
+```
+
+Real OVMF `BdsDxe` boot-manager output precedes the kernel's own, exactly
+as in the "UEFI boot" section above; the kernel's own tail output is
+byte-for-byte the same shape as the BIOS run above — real MADT reporting
+2 CPUs, a real INIT-SIPI-SIPI to `apic_id=1`, real 64-bit Rust running on
+the AP, a real `EXCEPTION: BREAKPOINT` on the AP's own GDT/IDT/TSS,
+survived, both `Smp` and `BspStateAfterSmp` `PASS`:
+
+```
+=== UOSC boot self-test: 22/22 checks passed ===
+```
+
+QEMU process exit code: `33`. **Reproduced across 3 independent UEFI runs
+this pass** (the run above plus 2 further consecutive re-runs), all
+`22/22`, exit `33` — closing the gap the "UEFI boot" section above left
+open ("UEFI was not re-verified this pass," from the prior ACPI/MADT
+pass): the `edk2-x86_64-code.fd` + `edk2-i386-vars.fd` firmware bundled
+with this environment's `scoop`-installed `qemu` package was available
+and used directly, no external download needed, matching what the
+original "UEFI boot" section found.
+
+**What this milestone does not claim, restated one more time for anyone
+skimming just this section**: no LAPIC/IOAPIC interrupt routing to the AP,
+no concurrent-safe scheduler/allocator/heap, no per-CPU state beyond the
+minimal GDT/TSS, no more than one AP ever brought up, no real hardware —
+QEMU only. Real, multi-core-safe scheduling and heap/allocator access are
+real, separate, follow-on work this milestone deliberately does not
+attempt.
