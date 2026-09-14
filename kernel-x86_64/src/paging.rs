@@ -203,6 +203,36 @@ pub fn map_page(
     map_page_with(mapper, &mut allocator, vaddr, flags)
 }
 
+/// Maps `vaddr` to a specific, caller-chosen physical frame, rather than one
+/// drawn from the shared `PhysicalAllocator` — needed for two things
+/// ordinary [`map_page`] can't do: identity-mapping the below-1MiB physical
+/// page `smp.rs` copies the real AP trampoline to (its address is fixed by
+/// the x86 SIPI vector mechanism, not chosen by an allocator), and mapping
+/// the real LAPIC's fixed MMIO physical address so `smp.rs` can reach it at
+/// all. Intermediate page-table frames (a new P3/P2/P1 table, if one is
+/// needed to reach `vaddr`) still come from the shared `PhysicalAllocator`
+/// via `frame_allocator` — only the final leaf mapping is pinned to the
+/// caller's frame.
+pub fn map_page_to_frame(
+    mapper: &mut OffsetPageTable<'static>,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    vaddr: VirtAddr,
+    frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), MemoryError> {
+    let page: Page<Size4KiB> = Page::containing_address(vaddr);
+    match unsafe { mapper.map_to(page, frame, flags, frame_allocator) } {
+        Ok(flush) => {
+            flush.flush();
+            Ok(())
+        }
+        Err(e) => {
+            serial_println!("[paging] map_page_to_frame({:#x} -> {:#x}) failed: {:?}", vaddr.as_u64(), frame.start_address().as_u64(), e);
+            Err(MemoryError::AccessViolation)
+        }
+    }
+}
+
 /// The real counterpart to [`map_page`]: removes the real page table entry
 /// (a real `mapper.unmap` + TLB flush, not just an accounting fiction) and
 /// returns the real physical frame it was backed by to the shared

@@ -577,6 +577,16 @@ pub fn on_timer_tick() {
     }
 }
 
+/// The real PIT tick count (200 Hz), incremented once per real timer
+/// interrupt in [`on_timer_tick`] above. Exposed so other real,
+/// hardware-driven timing needs elsewhere in this kernel — `smp.rs`'s
+/// INIT-SIPI-SIPI delays, specifically — can wait on the real hardware
+/// timer instead of an uncalibrated spin count, the same real 200 Hz
+/// source the scheduler itself is driven by, not a second, parallel clock.
+pub fn tick_count() -> u64 {
+    *TICKS.lock()
+}
+
 /// Read back for the boot self-test: did both long-running tasks actually
 /// run — i.e. did real context switches really transfer control into each
 /// one, not just get selected by `pick_next_task` on paper?
